@@ -4,12 +4,14 @@ from __future__ import annotations
 import mimetypes
 import os
 import smtplib
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from bob.tools_registry import TOOL_REGISTRY
 
 # ---------------------------------------------------------------------------
 # Small helpers
@@ -181,6 +183,42 @@ def chad_execute_plan(
         tool_args = tool_obj.get("args") or {}
         tool_result = ""
         message = ""
+
+        # Optional: sanity-check against registry so Bob can't invent random tools
+        if tool_name and tool_name not in TOOL_REGISTRY:
+            message = (
+                f"Chad was asked to run tool {tool_name!r}, but it is not registered "
+                "in bob.tools_registry. No tool was executed."
+            )
+            tool_result = ""
+            scratch_file = scratch_dir / f"{base}.txt"
+            scratch_file.write_text(
+                "GhostFrog Chad tool execution\n"
+                f"ID: {base}\n"
+                f"Time: {now}\n"
+                f"Tool name: {tool_name or '(none)'}\n"
+                f"Tool args: {tool_args}\n"
+                "Tool result:\n(no result – unknown tool)\n",
+                encoding="utf-8",
+            )
+            exec_report = {
+                "id": id_str,
+                "date": date_str,
+                "created_at": now,
+                "actor": "chad",
+                "kind": "exec_result",
+                "status": "success",
+                "touched_files": [],
+                "analysis_file": None,
+                "analysis_snippet": "",
+                "tool_name": tool_name,
+                "tool_args": tool_args,
+                "tool_result": tool_result,
+                "message": message,
+            }
+            exec_path = queue_dir / f"{base}.exec.json"
+            exec_path.write_text(str(exec_report), encoding="utf-8")
+            return exec_report
 
         # --- get_current_datetime ---
         if tool_name == "get_current_datetime":
@@ -488,6 +526,47 @@ def chad_execute_plan(
                     )
                 except Exception as e:
                     message = f"Chad failed to send_email due to error: {e!r}"
+                    tool_result = ""
+
+        # --- run_python_script ---
+        elif tool_name == "run_python_script":
+            rel_path = str(tool_args.get("path") or "")
+            args_list = tool_args.get("args") or []
+            try:
+                timeout = int(tool_args.get("timeout", 600))
+            except (TypeError, ValueError):
+                timeout = 600
+
+            target_path = _resolve_in_project_jail(rel_path, project_root)
+            if (
+                target_path is None
+                or not target_path.exists()
+                or not target_path.is_file()
+            ):
+                message = (
+                    f"Chad tried to run_python_script {rel_path!r} but the file does not exist, "
+                    "is not a file, or is outside the project jail."
+                )
+                tool_result = ""
+            else:
+                try:
+                    proc = subprocess.run(
+                        ["python3", str(target_path), *[str(a) for a in args_list]],
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                    )
+                    tool_result = (
+                        f"Exit code: {proc.returncode}\n\n"
+                        f"STDOUT:\n{proc.stdout}\n\n"
+                        f"STDERR:\n{proc.stderr}"
+                    )
+                    message = (
+                        f"Chad ran run_python_script on {rel_path!r} "
+                        f"with args {args_list!r} (exit code {proc.returncode})."
+                    )
+                except Exception as e:
+                    message = f"Chad failed to run_python_script due to error: {e!r}"
                     tool_result = ""
 
         else:

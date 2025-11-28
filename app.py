@@ -452,10 +452,28 @@ def _normalize_newlines(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
-def _safe_read_text(path: Path) -> str:
-    with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
-        data = f.read()
-    return _normalize_newlines(data)
+from pathlib import Path
+
+def _safe_read_text(target_path: str) -> str:
+    """
+    Safely read a file for diffing.
+
+    - If the file does not exist, return an empty string instead of raising.
+      This lets Chad treat it as a brand-new file.
+    - Always read as UTF-8 with replacement, so weird bytes don't crash us.
+    """
+    path = Path(target_path)
+
+    # New file: treat as empty original.
+    if not path.exists():
+        return ""
+
+    try:
+        with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+            return f.read()
+    except FileNotFoundError:
+        # Race condition / just deleted: also treat as empty.
+        return ""
 
 
 def _contains_suspicious_control_chars(text: str) -> bool:

@@ -563,6 +563,7 @@ def run_self_improvement_prompt(prompt: str, ticket: Ticket) -> Dict[str, Any]:
     # ----------------------------
     # Enforce ticket.safe_paths
     # ----------------------------
+    # Enforce ticket.safe_paths: drop any edits to files outside the whitelist
     task = plan.get("task") or {}
     edits = task.get("edits") or []
     if edits:
@@ -578,7 +579,6 @@ def run_self_improvement_prompt(prompt: str, ticket: Ticket) -> Dict[str, Any]:
                 dropped.append(rel or "(none)")
 
         if dropped:
-            # Minimal debug info in exec report / history logs
             print(f"[meta] Dropped edits outside safe_paths: {dropped}")
 
         task["edits"] = filtered

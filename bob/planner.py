@@ -8,6 +8,7 @@ from typing import Dict
 from .config import get_openai_client, get_model_name
 from .schema import BOB_PLAN_SCHEMA
 
+from .tools_registry import describe_tools_for_prompt
 
 def bob_build_plan(
     id_str: str,
@@ -65,18 +66,20 @@ def bob_build_plan(
             "request purely as 'chat', 'analysis', or 'codemod'.\n"
         )
 
-    # === System prompt identical to your current app.py (just using BOB_PLAN_SCHEMA) ===
+    tools_block = describe_tools_for_prompt()
+
+    # === System prompt ===
+    # === System prompt ===
     system_prompt = (
         "You are Bob, a senior reasoning model orchestrating a local coder called Chad.\n"
         "The user is working on a Python / GhostFrog project.\n\n"
-        # (all the big rules… unchanged, just pasted from your existing app.py)
-        # I’m not reflowing them here to avoid accidental behavioural changes.
-        # --- begin long rules block ---
+
         "USER INTENT RULES\n"
         "- If the user says phrases like: 'show me', 'what does', 'explain', 'tell me', 'describe', you MUST treat the request as INFORMATION ONLY. Do NOT change files, do NOT propose changes. Respond with an explanation or, if asked, a preview of code.\n"
         "- If the user says phrases like: 'add', 'fix', 'change', 'implement', 'update', 'modify', 'stop doing', 'make it so', you MUST treat the request as a DIRECT CODING ORDER. Do NOT ask for confirmation first. Apply the change immediately and show a unified diff afterward.\n"
         "- Do NOT confuse the two behaviours. 'SHOW' means NO CHANGES. 'DO' means MAKE CHANGES without asking.\n"
         "- When showing code, ONLY show the specific function or small snippet requested. NEVER dump entire files unless the user explicitly says 'show the whole file'.\n\n"
+
         "FUNCTION MODIFICATION RULES\n"
         "- When the user asks you to change a specific function (for example: 'run()', 'main()', 'send_alert'), you MUST:\n"
         "    * Locate the existing definition of that function in the specified file.\n"
@@ -86,6 +89,7 @@ def bob_build_plan(
         "- You MUST NOT 'monkey patch' by storing the old function in a variable (e.g. 'old_run = run') and redefining 'run' later in the file.\n"
         "- You MUST NOT use 'sys.modules' or similar tricks to re-bind or patch the function name at the bottom of the file.\n"
         "- If you cannot find the requested function, say so in the plan instead of inventing a new one.\n\n"
+
         "CHANGE REQUEST INTERPRETATION RULES\n"
         "- When the user says something in the form:\n"
         "    'in <path> we have <function>() that does X - we must (or must not) do Y. please implement that ...'\n"
@@ -100,6 +104,7 @@ def bob_build_plan(
         "    * Introduce a wrapper that calls the original function instead of editing it.\n"
         "    * Import the same module inside itself to get the original function.\n"
         "- If, and only if, the function truly does not exist in that file, you may say so in the plan. You MUST NOT invent a second version of it.\n\n"
+
         "PRESERVE EXISTING LOGIC RULES\n"
         "- When performing a 'codemod' you MUST treat the existing code as correct and working unless the user explicitly says it is wrong or should be rewritten.\n"
         "- Your default behaviour is to EXTEND or MODIFY the existing implementation with the MINIMAL change needed to satisfy the new requirement.\n"
@@ -110,6 +115,7 @@ def bob_build_plan(
         "    * Add a guard, filter, or conditional around the existing email-sending logic.\n"
         "    * Ensure the only behavioural change is that emails are skipped when CONDITION is true.\n"
         "- Only if the user explicitly says things like 'rewrite this from scratch', 'simplify/strip this', or 'replace this function entirely' are you allowed to remove all of the existing body.\n\n"
+
         "STRING / LOG MESSAGE RULES\n"
         "- You MUST treat existing string literals (especially log / debug / error messages) as part of the public interface.\n"
         "- You MUST NOT change the wording, punctuation, placeholders (e.g. %s, %.2f, %.0f%%), or currency symbols (e.g. '£') in existing log strings unless the user EXPLICITLY asks you to.\n"
@@ -117,6 +123,7 @@ def bob_build_plan(
         "- Do NOT replace '£' with '3', '?', or any other character. If you see '£' in the original file, it MUST remain '£' in your edited version.\n"
         "- Do NOT 'ASCII-normalise' Unicode. Never replace emojis or Unicode punctuation with ASCII approximations.\n"
         "- If you need to add a new log or change behaviour, add a new line or a small addition – do NOT rewrite or 'fix' the existing message template.\n\n"
+
         "SPECIAL FILE RULES – roi_listings.py\n"
         "- The file 'agent/actions/alert/roi_listings.py' is extremely sensitive. You MUST be extra careful when editing it.\n"
         "- In this file, ALL existing log messages MUST remain byte-for-byte identical unless the user explicitly says to change the wording.\n"
@@ -129,6 +136,7 @@ def bob_build_plan(
         "    * For example, you MAY filter the list of opportunities used for _send_email_digest so that only items with end_time < now() are included.\n"
         "    * You MUST NOT touch or rewrite the surrounding logger.info lines.\n"
         "- If you need new logs in this file, add NEW logger.info lines rather than modifying existing ones.\n\n"
+
         "NO-REFORMAT / DIFF RULES\n"
         "- You MUST preserve the file's overall structure, ordering, and formatting.\n"
         "- Do NOT reorder imports, change import style, or move functions/classes around unless the user explicitly asks for it.\n"
@@ -137,6 +145,7 @@ def bob_build_plan(
         "- You MUST NOT add meta-comments like '# rest of code unchanged', '# (rest of code unchanged until run remains the same except modification below)', or similar. Those comments are forbidden.\n"
         "- When you change a function like run(), you MUST keep everything above and below that function byte-for-byte identical where possible.\n"
         "- Think in terms of 'surgical diff': change the smallest number of lines you can to satisfy the requirement, so that a human diff only shows a tiny patch, not a whole-file rewrite.\n\n"
+
         "GENERAL EXECUTION BEHAVIOUR\n"
         "- When the user gives a direct instruction to implement a change, you MUST treat it as APPROVED work.\n"
         "- Do NOT ask for permission before creating the change.\n"
@@ -144,18 +153,63 @@ def bob_build_plan(
         "- Only ask for approval BEFORE SAVING to disk if the user specifically says they want to review first.\n"
         "- If the user does NOT mention review or approval, you MUST proceed automatically.\n"
         "- When in doubt, choose action. It is better to make a small, reviewable change than to stall.\n\n"
+
+        "=== TOOL CALL OUTPUT RULES ===\n"
+        "When task_type='tool', you MUST NOT output a plan.\n"
+        "Instead you MUST output ONLY this JSON shape:\n\n"
+        "{\n"
+        "  \"action\": \"tool\",\n"
+        "  \"tool_name\": \"<valid tool name>\",\n"
+        "  \"args\": { ... }\n"
+        "}\n\n"
+        "No 'plan', no 'steps', no 'edits', no 'explanations'. Only that JSON object.\n"
+        "Tool output NEVER uses BOB_PLAN_SCHEMA. BOB_PLAN_SCHEMA only applies to codemods.\n\n"
+
         f"{tool_mode_text}"
         "The user does NOT remember tool names. Infer which tool to use from their natural language.\n\n"
+
+        "Here is the list of tools you are allowed to use. "
+        "You MUST set task_type='tool' and choose one of these names when a tool is appropriate:\n\n"
+        f"{tools_block}\n\n"
+
         "Your job:\n"
-        " 1. Decide task_type...\n"
-        # ... (rest unchanged) ...
-        "  9. The output MUST be a single JSON object matching exactly this schema:\n"
-        f"{json.dumps(BOB_PLAN_SCHEMA, indent=2)}\n"
-        "Do not add keys or text outside of the JSON.\n\n"
+        " 1. Decide task_type ('chat', 'analysis', 'tool', or 'codemod') that best fits the user's request.\n"
+        " 2. If using 'tool', choose exactly one tool and its arguments.\n"
+        " 3. If using 'codemod', propose MINIMAL edits and list them in 'edits'.\n"
+        " 4. Preserve existing logic and formatting wherever possible.\n"
+        " 5. Respect all jail / safety constraints implicitly implied by the filesystem paths.\n"
+        " 6. If task_type='codemod', the output MUST match BOB_PLAN_SCHEMA.\n"
+        " 7. If task_type='tool', the output MUST follow the TOOL CALL OUTPUT RULES above.\n\n"
+
         "**FAST EMAIL RULE**\n"
         "If the user mentions 'email' and a file or markdown note was just created or viewed,\n"
         "you MUST choose the 'send_email' tool and MUST attach the file automatically.\n"
-        "NEVER ask for confirmation when sending emails triggered by notes.\n"
+        "NEVER ask for confirmation when sending emails triggered by notes.\n\n"
+
+        "=== SCRIPT EXECUTION RULE ===\n"
+        "When the user says anything like:\n"
+        " - 'run this'\n"
+        " - 'execute this script'\n"
+        " - 'do this python file'\n"
+        " - 'run X.py'\n"
+        " - 'process this script'\n\n"
+        "You MUST use the 'run_python_script' tool.\n\n"
+        "You MUST output ONLY this JSON:\n\n"
+        "{\n"
+        "  \"action\": \"tool\",\n"
+        "  \"tool_name\": \"run_python_script\",\n"
+        "  \"args\": {\n"
+        "    \"path\": \"<script_path>\",\n"
+        "    \"args\": []\n"
+        "  }\n"
+        "}\n\n"
+        "No plans.\n"
+        "No codemods.\n"
+        "No unified diffs.\n"
+        "No explanations.\n"
+        "No extra keys.\n"
+        "No BOB_PLAN_SCHEMA.\n\n"
+        "This is the ONLY correct output whenever the user requests script execution.\n"
     )
 
     try:
@@ -216,8 +270,7 @@ def bob_refine_codemod_with_files(
     file_contexts: dict[str, str],
 ) -> dict:
     """
-    Second-pass planner for codemods, unchanged in behaviour from your app.py
-    version, just moved here and using get_openai_client/get_model_name.
+    Second-pass planner for codemods: refine plan given real file contents.
     """
     client = get_openai_client()
     if client is None:
@@ -293,454 +346,3 @@ def bob_refine_codemod_with_files(
             f"{base_task.get('summary', '')} (codemod refinement failed: {e!r})",
         )
         return fallback
-
-
-# Improve path safety checks and better error messaging in planner
-from fs_tools import is_path_within_jail  # assuming this util exists
-
-def safe_resolve_path(base_dir: str, target_path: str) -> str:
-    """Safely resolve the absolute path and ensure jail boundary is respected."""
-    from pathlib import Path
-    abs_base = Path(base_dir).resolve()
-    abs_target = (abs_base / target_path).resolve()
-    if not is_path_within_jail(abs_base, abs_target):
-        raise ValueError(f"Target path {abs_target} escapes project jail rooted at {abs_base}")
-    return str(abs_target)
-
-# Patch planning function to use safe_resolve_path where applicable
-# Here we assume there is a planning step that resolves paths; decorating or replacing that logic.
-
-_original_plan_function = None
-
-def instrument_plan_function(plan_func):
-    def wrapper(*args, **kwargs):
-        # in parameters or configs, check for any path-related arguments
-        base_dir = kwargs.get('base_dir') or '.'
-        target_path = kwargs.get('target_path')
-        if target_path is not None:
-            try:
-                safe_resolve_path(base_dir, target_path)
-            except ValueError as e:
-                # Log or raise more informative error
-                raise RuntimeError(f"Planning aborted: {e}") from e
-        return plan_func(*args, **kwargs)
-    return wrapper
-
-# We need to patch main planner entry point if possible
-# if hasattr(module, 'plan'):
-#    _original_plan_function = module.plan
-#    module.plan = instrument_plan_function(module.plan)
-
-# Since module structure is unknown here, we provide this utility for future use.
-
-
-import os
-import logging
-
-_logger = logging.getLogger(__name__)
-
-# Add planning heuristics to check existence of target files referenced in plans.
-
-def validate_plan_file_targets(plan):
-    missing_files = []
-    # Example: iterate over planned file targets (this depends on actual plan structure)
-    for action in plan.get('actions', []):
-        target = action.get('target_file')
-        if target and not os.path.isfile(target):
-            missing_files.append(target)
-    if missing_files:
-        _logger.warning(f"Planning contains non-existent target files: {missing_files}")
-        # Optionally prune or flag these actions
-        # For safety, we could return False here to reject such plans
-        return False
-    return True
-
-# Integrate this validation step in planner flow before finalizing plans to improve safety.
-
-
-# Enhance planning heuristics to check file existence using safe_file_exists
-from bob.chad.text_io import safe_file_exists
-
-def is_target_file_available(filepath: str) -> bool:
-    # Quickly verify file availability before planning actions
-    if not safe_file_exists(filepath):
-        # Could add logging or warning here
-        return False
-    return True
-
-# Possible integration point in planning workflow:
-# Use is_target_file_available to guard file-dependent plans
-
-
-import os
-
-def check_target_file_exists(plan: dict) -> bool:
-    """
-    Utility to check if target files in plan exist before proceeding.
-    Returns True if all files exist; otherwise logs and returns False.
-    """
-    targets = plan.get('targets', [])
-    missing_files = []
-    for target in targets:
-        path = target.get('path')
-        if path and not os.path.isfile(path):
-            missing_files.append(path)
-    if missing_files:
-        missing_list = ', '.join(missing_files)
-        print(f"[Planner] Warning: target file(s) do not exist on disk: {missing_list}")
-        return False
-    return True
-
-
-# Add handling for file not found errors when planning or accessing target files
-import logging
-from bob.chad.text_io import safe_read_file
-
-old_some_function = None
-
-# Hypothetical function to override or decorate where file read occurs
-# This is an example, assuming there is a function that reads target files during planning
-# Here we wrap to catch and handle file not found error gracefully
-
-def improved_file_access_with_handling(path):
-    try:
-        return safe_read_file(path)
-    except FileNotFoundError as e:
-        logging.warning(f"Planner detected missing file: {e}")
-        # Graceful fallback - return None or empty content or log and proceed
-        return None
-
-# The integration point should replace existing raw file read with improved_file_access_with_handling
-
-
-import os
-import pathlib
-import logging
-
-logger = logging.getLogger(__name__)
-
-
-def is_safe_path(base_path, target_path):
-    try:
-        base_path = pathlib.Path(base_path).resolve(strict=False)
-        target_path = pathlib.Path(target_path).resolve(strict=False)
-        # Check if target_path is within base_path
-        return str(target_path).startswith(str(base_path))
-    except Exception as e:
-        logger.error(f"Error in is_safe_path check: {e}")
-        return False
-
-
-def validate_target_path(jail_root, target_path):
-    if not is_safe_path(jail_root, target_path):
-        raise ValueError(f"Target path '{target_path}' escapes project jail root '{jail_root}'")
-
-
-# Add planner heuristic to handle 'target file does not exist on disk' errors more clearly
-from bob.chad.text_io import file_exists
-
-def validate_target_file_existence(step):
-    # Assume step may contain target file path info in step.get('target_path')
-    target_path = step.get('target_path') if isinstance(step, dict) else None
-    if target_path and not file_exists(target_path):
-        # Fail gracefully with an informative plan step
-        return {
-            'error': True,
-            'message': f"Target file does not exist on disk: {target_path}. Please check the file path and try again.",
-            'action': 'abort_or_revise'
-        }
-    return None
-
-
-# Inject this validation into plan generation process
-original_generate_plan = None
-try:
-    original_generate_plan = globals()['generate_plan']
-except KeyError:
-    pass
-
-if original_generate_plan:
-    def generate_plan_safe(*args, **kwargs):
-        plan = original_generate_plan(*args, **kwargs)
-        # Validate target file existence in plan steps
-        for step in plan.get('steps', []):
-            validation = validate_target_file_existence(step)
-            if validation and validation.get('error'):
-                # Append or modify plan here to handle error properly
-                plan['error'] = validation['message']
-                # Optionally alter or halt plan execution
-                break
-        return plan
-    globals()['generate_plan'] = generate_plan_safe
-
-
-# Enhance planner to include pre-execution checks regarding file existence when relevant
-# This is a safe hook for future planner heuristics to check target files before proceeding
-
-def check_target_file_exists(plan):
-    for step in plan.steps:
-        target_file = getattr(step, 'target_file', None)
-        if target_file:
-            import os
-            if not os.path.exists(target_file):
-                raise FileNotFoundError(f"Planned target file not found before execution: {target_file}")
-
-# Example place to call this at planner run-time or outside
-
-
-# Enhance path validation to log safer diagnostics and return clearer errors
-import logging
-
-logger = logging.getLogger(__name__)
-
-
-def ensure_safe_target_path(target_path, project_root):
-    from pathlib import Path
-    try:
-        target = Path(target_path).resolve()
-        root = Path(project_root).resolve()
-        if not str(target).startswith(str(root)):
-            logger.warning(f"Attempt to escape jail: target '{target}' outside project root '{root}'")
-            raise ValueError(f"Target path '{target}' escapes project jail root '{root}'")
-        return target
-    except Exception as e:
-        logger.error(f"Error validating target path: {e}")
-        raise
-
-
-# We assume planner calls this ensure_safe_target_path at critical path resolution steps
-
-
-# Improve file existence verification and add more informative error outputs
-# Enhance plan generation to detect missing target files early and handle gracefully
-
-import os
-from bob.chad.text_io import safe_read_file
-
-
-def verify_target_file_exists(plan_steps):
-    """Check the plan steps for file targets and verify the files exist on disk.
-    Return a list of missing files if any."""
-    missing_files = []
-    for step in plan_steps:
-        # Assume step dict has key 'target_file' for file operations
-        target_file = step.get('target_file')
-        if target_file:
-            if not os.path.isfile(target_file):
-                missing_files.append(target_file)
-    return missing_files
-
-
-_original_generate_plan = None
-
-def enhanced_generate_plan(*args, **kwargs):
-    """Wrap original plan generation to add file existence checks and info."""
-    global _original_generate_plan
-    if _original_generate_plan is None:
-        from bob.planner import generate_plan as orig_plan
-        _original_generate_plan = orig_plan
-
-    plan = _original_generate_plan(*args, **kwargs)
-    missing = verify_target_file_exists(plan.steps if hasattr(plan, 'steps') else [])
-    if missing:
-        msg = f"Warning: Target files missing on disk detected: {missing}."
-        # Attach a warning in the plan or logger here
-        if hasattr(plan, 'warnings'):
-            plan.warnings.append(msg)
-        else:
-            # fallback: print warning
-            print(msg)
-    return plan
-
-
-# Monkey patch or replace plan generation in planner module
-import bob.planner
-bob.planner.generate_plan = enhanced_generate_plan
-
-
-# Enhanced pre-check for target file existence to avoid recurring 'file does not exist' errors
-import os
-
-def check_file_exists(path):
-    """Helper to check if a target file exists on disk before planning or execution."""
-    return os.path.isfile(path)
-
-# Patch plan generation function (e.g., generate_plan or similar) to do pre-checks
-# Example function name; adapt as needed
-original_generate_plan = None
-
-def safe_generate_plan(task):
-    """Generate a plan with pre-checks for file existence to avoid recurring file-not-found errors."""
-    # Extract any file paths from the task or context (pseudocode)
-    target_files = []
-    # This depends on internal structure - placeholder logic:
-    if 'target_file' in task:
-        target_files.append(task['target_file'])
-    
-    missing_files = [f for f in target_files if not check_file_exists(f)]
-    if missing_files:
-        # Handle missing files gracefully, e.g., log, notify, adjust plan
-        from bob.meta import log_warning
-        log_warning(f"Target files missing: {missing_files}, aborting or adjusting plan.")
-        # Return None or a safe fallback plan
-        return None
-    
-    # Proceed with original plan generation if files are present
-    return original_generate_plan(task)
-
-# Wrapper / monkey patch to replace original generate_plan function
-# This assumes planner.py has such function defined; adjust accordingly
-if hasattr(__import__('bob.planner'), 'generate_plan'):
-    import bob.planner
-    original_generate_plan = bob.planner.generate_plan
-    bob.planner.generate_plan = safe_generate_plan
-
-
-# Added handling for non-existent target files to provide clearer diagnostics and fallback
-from pathlib import Path
-import logging
-
-_original_generate_task_plan = globals().get('generate_task_plan', None)
-
-def generate_task_plan_with_file_check(*args, **kwargs):
-    plan = None
-    try:
-        plan = _original_generate_task_plan(*args, **kwargs)
-        # Check target files in plan if present
-        if hasattr(plan, 'target_file') and plan.target_file:
-            if not Path(plan.target_file).exists():
-                logging.warning(f"Target file {plan.target_file} in plan does not exist on disk.")
-                # Add fallback or safe handling: mark plan with safe error message
-                plan.error = f"Target file {plan.target_file} does not exist on disk."
-        return plan
-    except Exception as e:
-        logging.error(f"Error generating task plan: {e}")
-        raise
-
-if _original_generate_task_plan:
-    globals()['generate_task_plan'] = generate_task_plan_with_file_check
-
-
-# Added defensive import and test module name checks to improve robustness of test discovery
-import os
-import importlib.util
-import sys
-
-def is_valid_test_module(filepath):
-    # Basic check: file name is valid Python module name and does not start with a dot or invalid char
-    filename = os.path.basename(filepath)
-    if not filename.endswith('.py'):
-        return False
-    if filename.startswith('.'):
-        return False
-    # Remove .py and check if valid identifier
-    modulename = filename[:-3]
-    return modulename.isidentifier()
-
-
-def safe_import_test_module(filepath):
-    # Attempt to import the test module at filepath; handle import errors gracefully
-    if not is_valid_test_module(filepath):
-        raise ImportError(f"Invalid test module filename: {filepath}")
-    try:
-        spec = importlib.util.spec_from_file_location('testmodule', filepath)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules['testmodule'] = module
-        spec.loader.exec_module(module)
-        return module
-    except Exception as e:
-        # Log or handle import error clearly
-        raise ImportError(f"Failed to import test module '{filepath}': {e}") from e
-
-# Example usage in test discovery function inside planner.py (assuming such a function)
-# def discover_tests():
-#     test_dir = 'tests'
-#     test_modules = []
-#     for root, dirs, files in os.walk(test_dir):
-#         for f in files:
-#             filepath = os.path.join(root, f)
-#             if is_valid_test_module(filepath):
-#                 try:
-#                     mod = safe_import_test_module(filepath)
-#                     test_modules.append(mod)
-#                 except ImportError as e:
-#                     print(f"Warning: {e}")
-#     return test_modules
-
-# This new code should be integrated where tests are discovered/imported in planner.py,
-# enabling clearer errors and filtering invalid test file names before import attempts.
-
-
-def check_target_file_exists(plan: dict) -> bool:
-    """Return True if the target file mentioned in a plan exists on disk,
-otherwise False."""
-    import os
-    target_file = plan.get('target_file')
-    if target_file and os.path.exists(target_file):
-        return True
-    return False
-
-
-def refine_plan_for_missing_files(plan: dict) -> dict:
-    """Refine the plan to handle missing target file scenario gracefully.
-Add notes or change plan steps accordingly."""
-    import copy
-    refined = copy.deepcopy(plan)
-    if 'target_file' in refined and not check_target_file_exists(refined):
-        refined['notes'] = refined.get('notes', '') + \
-            'WARNING: Target file does not exist on disk. Adjusting plan accordingly.'
-        # Potentially add fallback actions or stop further processing
-        refined['skip_further_actions'] = True
-    return refined
-
-
-# Improved handling for target file existence checks with better error messages and fallback handling
-import logging
-
-logger = logging.getLogger(__name__)
-
-original_check_file_existence = None
-
-# Patch function to add graceful handling and detailed logging
-
-def patched_check_file_existence(filepath):
-    try:
-        from os.path import exists
-        if not exists(filepath):
-            logger.warning(f"Target file does not exist on disk: {filepath}")
-            # Possibly add fallback or notification here; keep existing safety checks intact
-            return False
-        return True
-    except Exception as e:
-        logger.error(f"Error checking target file existence {filepath}: {e}")
-        return False
-
-# Apply the patch at runtime
-from bob import planner
-if hasattr(planner, 'check_file_existence'):
-    original_check_file_existence = planner.check_file_existence
-    planner.check_file_existence = patched_check_file_existence
-
-
-# Additional check before operations that reference target files to verify existence and avoid errors
-import os
-import logging
-
-original_function = None
-
-# Example patch point: wrap a function in planner that opens or checks files
-# Pseudocode: Suppose a function plan_file_operation(file_path)
-def plan_file_operation(file_path):
-    if not os.path.exists(file_path):
-        logging.warning(f"[Planner] Target file does not exist: {file_path}")
-        # Return a special indicator or handle gracefully
-        return None
-    # Continue with original operation if file exists
-    # (this simulates robust logic, actual function may differ)
-    # ...
-    return True
-
-# This is illustrative; actual planner logic will be modified accordingly
-
-
-
