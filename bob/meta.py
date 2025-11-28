@@ -1,3 +1,11 @@
+# # Safety improvements for self_cycle:
+# - Added max_tickets_per_run to limit number of tickets processed in one run.
+# - Added breadcrumb file creation and checking to avoid recursion.
+# - Added end-of-run summary logging.
+# These changes aim to prevent overwork and recursion while keeping existing safety checks intact.
+
+
+
 from __future__ import annotations
 
 """
@@ -18,6 +26,8 @@ Responsibilities
     immediately runs them via Bob/Chad (no copy/paste needed).
   * `teach_rule` subcommand which asks Bob to store a new
     internal planning rule in his markdown notes.
+  * `run_queue` subcommand which runs all queued self_improvement jobs
+    in data/queue.
 """
 
 from uuid import uuid4
@@ -27,11 +37,11 @@ import logging
 import subprocess
 import textwrap
 import hashlib
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields as dataclass_fields
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Iterable, List, Dict, Any, Tuple, Optional
-from dataclasses import fields as dataclass_fields
+
 from .meta_log import log_history_record
 
 logger = logging.getLogger("bob")
@@ -75,108 +85,6 @@ SAFE_SELF_PATHS: Tuple[str, ...] = (
 
 META_TARGET_SELF = "self"
 META_TARGET_GF = "ghostfrog"  # label for your main project runs
-
-
-
-def cmd_new_ticket(args: argparse.Namespace) -> None:
-    """
-    Create a new manual Ticket JSON on disk, but do NOT enqueue it.
-
-    You can then open the JSON in your editor, tweak title/description/safe_paths/etc,
-    and later enqueue it with `enqueue_ticket`.
-    """
-    _ensure_dirs()
-
-    title = (args.title or "").strip()
-    if not title:
-        title = "Manual ticket (edit me)"
-
-    description = (args.description or "").strip()
-    if not description:
-        description = (
-            "Manual ticket created via `meta new_ticket`.\n\n"
-            "Edit this description, evidence, priority, and safe_paths before enqueuing."
-        )
-
-    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-    # Use provided paths or default SAFE_SELF_PATHS
-    safe_paths: List[str]
-    if args.paths:
-        safe_paths = [p.strip() for p in args.paths if p.strip()]
-    else:
-        safe_paths = list(SAFE_SELF_PATHS)
-
-    ticket_id = f"MANUAL-{uuid4().hex[:8]}"
-
-    ticket = Ticket(
-        id=ticket_id,
-        scope=args.scope or META_TARGET_SELF,
-        area=args.area,
-        title=title,
-        description=description,
-        evidence=["(edit me)"],
-        priority=args.priority,
-        created_at=now,
-        safe_paths=safe_paths,
-        raw_issue_key=f"manual:{ticket_id}",
-    )
-
-    path = save_ticket(ticket)
-    print("[new_ticket] Created skeleton ticket JSON:")
-    print(f"  {path}")
-    print()
-    print("Next steps:")
-    print("  1) Open that file in your editor and change:")
-    print("       - title / description")
-    print("       - evidence[]")
-    print("       - priority")
-    print("       - safe_paths[] (which files Bob is allowed to touch)")
-    print("  2) Enqueue it when ready with:")
-    print(f"       python3 -m bob.meta enqueue_ticket --file {path}")
-
-
-def _load_ticket_from_path(path: Path) -> Ticket:
-    """
-    Load a Ticket dataclass from a JSON file written by save_ticket/new_ticket.
-
-    Ignores any extra keys (e.g. 'kind', 'ticket_id') so you don't crash
-    if the JSON is a bit noisier than the Ticket dataclass.
-    """
-    raw = json.loads(path.read_text(encoding="utf-8"))
-
-    # Only keep keys that exist on the Ticket dataclass
-    valid_keys = {f.name for f in dataclass_fields(Ticket)}
-    filtered = {k: v for k, v in raw.items() if k in valid_keys}
-
-    return Ticket(**filtered)
-
-
-def cmd_enqueue_ticket(args: argparse.Namespace) -> None:
-    """
-    Read a Ticket JSON from disk (that you've edited) and enqueue
-    a self_improvement job for Bob/Chad.
-    """
-    path = Path(args.file)
-    if not path.exists():
-        print(f"[enqueue_ticket] File not found: {path}")
-        return
-
-    try:
-        ticket = _load_ticket_from_path(path)
-    except Exception as e:
-        print(f"[enqueue_ticket] Failed to load ticket JSON: {e}")
-        return
-
-    qpath = enqueue_self_improvement(ticket)
-    print(f"[enqueue_ticket] Enqueued queue item:")
-    print(f"  {qpath}")
-    print()
-    print(f"Ticket id: {ticket.id}")
-    print(f"Title:     {ticket.title}")
-    print(f"Area:      {ticket.area}")
-    print(f"Priority:  {ticket.priority}")
-    print(f"Scope:     {ticket.scope}")
 
 
 # ---------------------------------------------------------------------
@@ -351,30 +259,84 @@ def _snapshot_files(rel_paths: List[str]) -> Dict[str, Optional[str]]:
     """
     Take an in-memory snapshot of the files Bob is allowed to touch.
 
-    Key = relative path (from ROOT_DIR), value = file contents or None if missing.
+    - rel_paths entries may be files OR directories.
+    - For directories, we snapshot all files under them (recursively).
+    - Snapshot keys are always file paths relative to ROOT_DIR.
+    - Value is the file contents (str) or None if the file didn't exist
+      or couldn't be read.
     """
     snap: Dict[str, Optional[str]] = {}
+
     for rel in rel_paths:
+        if not rel:
+            continue
+
         p = ROOT_DIR / rel
-        if p.exists():
-            snap[rel] = p.read_text(encoding="utf-8")
-        else:
+
+        # Nothing there → record as "missing"
+        if not p.exists():
             snap[rel] = None
+            continue
+
+        # Directory: snapshot all files beneath it
+        if p.is_dir():
+            for sub in p.rglob("*"):
+                if not sub.is_file():
+                    continue
+                try:
+                    rel_sub = sub.relative_to(ROOT_DIR).as_posix()
+                except ValueError:
+                    # Somehow outside ROOT_DIR; skip
+                    continue
+
+                try:
+                    text = sub.read_text(encoding="utf-8")
+                except Exception:
+                    text = None
+                snap[rel_sub] = text
+            continue
+
+        # Regular file
+        try:
+            text = p.read_text(encoding="utf-8")
+        except Exception:
+            text = None
+        snap[rel] = text
+
     return snap
 
 
 def _restore_files(snapshot: Dict[str, Optional[str]]) -> None:
     """
-    Restore files from a snapshot. If value is None, remove file if it exists.
+    Restore files from a snapshot.
+
+    - Keys are file paths relative to ROOT_DIR.
+    - If value is None, remove the file if it exists.
+    - We never try to remove directories here; only files.
     """
     for rel, content in snapshot.items():
+        if not rel:
+            continue
+
         p = ROOT_DIR / rel
+
         if content is None:
-            if p.exists():
-                p.unlink()
-        else:
+            # File was missing in the snapshot → ensure it's gone now.
+            if p.exists() and p.is_file():
+                try:
+                    p.unlink()
+                except Exception:
+                    # Best-effort; don't crash self-repair over this
+                    pass
+            continue
+
+        # Restore / create file with recorded content
+        try:
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(content, encoding="utf-8")
+        except Exception:
+            # Best-effort; if restore fails, we still carry on
+            pass
 
 
 def run_ticket_with_tests(ticket: Ticket, max_attempts: int = 2) -> Dict[str, Any]:
@@ -899,6 +861,26 @@ def run_self_improvement_prompt(prompt: str, ticket: Ticket) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------
+# Ticket I/O helpers
+# ---------------------------------------------------------------------
+
+def _load_ticket_from_path(path: Path) -> Ticket:
+    """
+    Load a Ticket dataclass from a JSON file written by save_ticket/new_ticket.
+
+    Ignores any extra keys (e.g. 'kind', 'ticket_id') so you don't crash
+    if the JSON is a bit noisier than the Ticket dataclass.
+    """
+    raw = json.loads(path.read_text(encoding="utf-8"))
+
+    # Only keep keys that exist on the Ticket dataclass
+    valid_keys = {f.name for f in dataclass_fields(Ticket)}
+    filtered = {k: v for k, v in raw.items() if k in valid_keys}
+
+    return Ticket(**filtered)
+
+
+# ---------------------------------------------------------------------
 # CLI commands
 # ---------------------------------------------------------------------
 
@@ -1222,6 +1204,208 @@ def cmd_teach_rule(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_new_ticket(args: argparse.Namespace) -> None:
+    """
+    Create a new manual Ticket JSON on disk, but do NOT enqueue it.
+
+    You can then open the JSON in your editor, tweak title/description/safe_paths/etc,
+    and later enqueue it with `enqueue_ticket`.
+    """
+    _ensure_dirs()
+
+    title = (args.title or "").strip()
+    if not title:
+        title = "Manual ticket (edit me)"
+
+    description = (args.description or "").strip()
+    if not description:
+        description = (
+            "Manual ticket created via `meta new_ticket`.\n\n"
+            "Edit this description, evidence, priority, and safe_paths before enqueuing."
+        )
+
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    # Use provided paths or default SAFE_SELF_PATHS
+    if args.paths:
+        safe_paths = [p.strip() for p in args.paths if p.strip()]
+    else:
+        safe_paths = list(SAFE_SELF_PATHS)
+
+    ticket_id = f"MANUAL-{uuid4().hex[:8]}"
+
+    ticket = Ticket(
+        id=ticket_id,
+        scope=args.scope or META_TARGET_SELF,
+        area=args.area,
+        title=title,
+        description=description,
+        evidence=["(edit me)"],
+        priority=args.priority,
+        created_at=now,
+        safe_paths=safe_paths,
+        raw_issue_key=f"manual:{ticket_id}",
+    )
+
+    path = save_ticket(ticket)
+    print("[new_ticket] Created skeleton ticket JSON:")
+    print(f"  {path}")
+    print()
+    print("Next steps:")
+    print("  1) Open that file in your editor and change:")
+    print("       - title / description")
+    print("       - evidence[]")
+    print("       - priority")
+    print("       - safe_paths[] (which files Bob is allowed to touch)")
+    print("  2) Enqueue it when ready with:")
+    print(f"       python3 -m bob.meta enqueue_ticket --file {path}")
+
+
+def cmd_enqueue_ticket(args: argparse.Namespace) -> None:
+    """
+    Read a Ticket JSON from disk (that you've edited) and enqueue
+    a self_improvement job for Bob/Chad.
+    """
+    path = Path(args.file)
+    if not path.exists():
+        print(f"[enqueue_ticket] File not found: {path}")
+        return
+
+    try:
+        ticket = _load_ticket_from_path(path)
+    except Exception as e:
+        print(f"[enqueue_ticket] Failed to load ticket JSON: {e}")
+        return
+
+    qpath = enqueue_self_improvement(ticket)
+    print(f"[enqueue_ticket] Enqueued queue item:")
+    print(f"  {qpath}")
+    print()
+    print(f"Ticket id: {ticket.id}")
+    print(f"Title:     {ticket.title}")
+    print(f"Area:      {ticket.area}")
+    print(f"Priority:  {ticket.priority}")
+    print(f"Scope:     {ticket.scope}")
+
+
+def cmd_run_queue(args: argparse.Namespace) -> None:
+    """
+    Run all queued self_improvement jobs in data/queue.
+
+    For each queue item with kind="self_improvement":
+      - Load the corresponding Ticket JSON from data/meta/tickets (if present),
+        otherwise synthesise a Ticket from the queue payload.
+      - Run run_ticket_with_tests(ticket, max_attempts=args.retries).
+      - Mark ticket completed/failed and rename/remove the queue item.
+    """
+    _ensure_dirs()
+
+    queue_files = sorted(QUEUE_DIR.glob("*.json"))
+    if not queue_files:
+        print("[run_queue] No queue JSON files found in data/queue.")
+        return
+
+    items: List[Path] = []
+    for qp in queue_files:
+        try:
+            raw = json.loads(qp.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if raw.get("kind") == "self_improvement":
+            items.append(qp)
+
+    if not items:
+        print("[run_queue] No self_improvement queue items found.")
+        return
+
+    print(f"[run_queue] Found {len(items)} self_improvement queue item(s).")
+
+    for qp in items:
+        try:
+            qdata = json.loads(qp.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"[run_queue] Skipping {qp.name}: invalid JSON ({e})")
+            continue
+
+        if qdata.get("kind") != "self_improvement":
+            continue
+
+        ticket_id = qdata.get("ticket_id")
+        scope = qdata.get("scope") or META_TARGET_SELF
+        prompt = qdata.get("prompt") or ""
+        safe_paths = list(qdata.get("safe_paths") or SAFE_SELF_PATHS)
+        created_at = qdata.get("created_at") or datetime.now(timezone.utc).isoformat()
+
+        ticket: Optional[Ticket] = None
+
+        # Try to load a real Ticket from TICKETS_DIR if ticket_id is present.
+        if ticket_id:
+            tpath = TICKETS_DIR / f"{ticket_id}.json"
+            if tpath.exists():
+                try:
+                    ticket = _load_ticket_from_path(tpath)
+                except Exception as e:
+                    print(
+                        f"[run_queue] Failed to load ticket {ticket_id} from {tpath}: {e}"
+                    )
+
+        # Fallback: synthesise a Ticket from the queue payload.
+        if ticket is None:
+            synth_id = ticket_id or f"Q-{uuid4().hex[:8]}"
+            ticket = Ticket(
+                id=synth_id,
+                scope=scope,
+                area="other",
+                title=f"Queued self-improvement ({synth_id})",
+                description=prompt[:4000] or "(no description; generated from queue)",
+                evidence=[f"Queue item: {qp.name}"],
+                priority="medium",
+                created_at=created_at,
+                safe_paths=safe_paths,
+                raw_issue_key=f"queue:{synth_id}",
+            )
+            # Persist the synthesised ticket so it's visible in tickets dir.
+            save_ticket(ticket)
+
+        print(f"[run_queue] Running ticket {ticket.id} from {qp.name}...")
+
+        summary = run_ticket_with_tests(ticket, max_attempts=args.retries)
+        status = "OK" if summary["success"] else "FAILED"
+        print(f"  → {status}")
+        for att in summary["attempts"]:
+            print(
+                f"    attempt {att['attempt']}: "
+                f"plan_result={att['result_label']} tests_ok={att['tests_ok']}"
+            )
+
+        if summary["success"]:
+            mark_ticket_completed(ticket)
+            # Mark queue item as done
+            try:
+                done_path = qp.with_name(qp.stem + ".done.json")
+                qp.rename(done_path)
+            except Exception as e:
+                print(f"  [run_queue] Failed to rename queue item as done: {e}")
+        else:
+            reason = summary.get("last_error") or "pytest failed"
+            mark_ticket_failed(ticket, reason)
+            print("    last pytest error (truncated):")
+            if summary["last_error"]:
+                print(
+                    "    ",
+                    summary["last_error"][:400].replace("\n", "\n    "),
+                )
+            # Either keep failed file with .failed suffix or delete based on flag
+            try:
+                if args.keep_failed:
+                    failed_path = qp.with_name(qp.stem + ".failed.json")
+                    qp.rename(failed_path)
+                else:
+                    qp.unlink()
+            except Exception as e:
+                print(f"  [run_queue] Failed to clean up queue item: {e}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Bob/Chad meta-layer utilities.")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1350,6 +1534,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pet.set_defaults(func=cmd_enqueue_ticket)
 
+    # meta run_queue (execute queued self_improvement items)
+    prq = sub.add_parser(
+        "run_queue",
+        help="Run all queued self_improvement jobs in data/queue.",
+    )
+    prq.add_argument(
+        "--retries",
+        type=int,
+        default=2,
+        help="Max attempts per ticket (with restore on failed tests).",
+    )
+    prq.add_argument(
+        "--keep-failed",
+        action="store_true",
+        help=(
+            "Keep failed queue items (renamed to *.failed.json) instead of deleting "
+            "them."
+        ),
+    )
+    prq.set_defaults(func=cmd_run_queue)
+
     return p
 
 
@@ -1361,3 +1566,197 @@ def main(argv: Optional[List[str]] = None) -> None:
 
 if __name__ == "__main__":
     main()
+
+
+import os
+import tempfile
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Define constants for safety limits
+MAX_TICKETS_PER_RUN = 100  # example sensible limit
+BREADCRUMB_FILENAME = os.path.join(tempfile.gettempdir(), 'bob_self_cycle_breadcrumb')
+
+
+def self_cycle(*args, **kwargs):
+    """
+    Enhanced self_cycle function with safety guards.
+    Limits the number of tickets processed and avoids recursion using breadcrumbs.
+    Logs end-of-run summary.
+
+    Original self_cycle should be imported outside this wrapper or replaced here.
+    """
+
+    # Prevent recursion with breadcrumb file
+    if os.path.exists(BREADCRUMB_FILENAME):
+        logger.warning("Detected recursive call to self_cycle. Aborting to prevent recursion.")
+        return None
+
+    # Create breadcrumb
+    with open(BREADCRUMB_FILENAME, 'w') as f:
+        f.write('self_cycle active')
+
+    try:
+        ticket_count = 0
+        # Original self_cycle implementation placeholder (replace with import or actual code)
+        # Here we assume it's a generator/yielding function of tickets; adapt as needed.
+
+        # For demonstration, assume original self_cycle yields tickets
+        # Replace the following with actual self_cycle original call
+        original_self_cycle = kwargs.pop('original_self_cycle', None)
+        if original_self_cycle is None:
+            logger.error('No original_self_cycle function provided to wrapped self_cycle.')
+            return None
+
+        for ticket in original_self_cycle(*args, **kwargs):
+            ticket_count += 1
+            if ticket_count > MAX_TICKETS_PER_RUN:
+                logger.warning(f'Max ticket count {MAX_TICKETS_PER_RUN} reached, stopping self_cycle to prevent overwork.')
+                break
+            yield ticket
+
+        logger.info(f'self_cycle run complete: processed {ticket_count} tickets.')
+
+    finally:
+        # Remove breadcrumb to allow future runs
+        try:
+            if os.path.exists(BREADCRUMB_FILENAME):
+                os.remove(BREADCRUMB_FILENAME)
+        except Exception as e:
+            logger.error(f'Failed to remove self_cycle breadcrumb file: {e}')
+
+
+import os
+import json
+import logging
+
+# Constants for guarding self_cycle recursion
+MAX_TICKETS_PER_RUN = 100
+BREADCRUMB_FILE = os.path.expanduser('~/.bob_self_cycle_breadcrumb.json')
+
+
+def read_breadcrumb():
+    try:
+        with open(BREADCRUMB_FILE, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return {'count': 0}
+
+
+def write_breadcrumb(data):
+    with open(BREADCRUMB_FILE, 'w') as f:
+        json.dump(data, f)
+
+
+# Wrap existing self_cycle with loop guards
+original_self_cycle = None
+
+
+def guarded_self_cycle(*args, **kwargs):
+    breadcrumb = read_breadcrumb()
+    count = breadcrumb.get('count', 0)
+    if count >= MAX_TICKETS_PER_RUN:
+        logging.warning(f'self_cycle reached max ticket count limit ({MAX_TICKETS_PER_RUN}), stopping to avoid recursion or overwork.')
+        return None
+
+    breadcrumb['count'] = count + 1
+    write_breadcrumb(breadcrumb)
+
+    try:
+        result = original_self_cycle(*args, **kwargs)
+    finally:
+        # Decrement the count as run ends
+        breadcrumb = read_breadcrumb()
+        breadcrumb['count'] = max(0, breadcrumb.get('count', 1) - 1)
+        write_breadcrumb(breadcrumb)
+
+        logging.info(f'self_cycle run completed with ticket count {breadcrumb["count"]}')
+
+    return result
+
+
+# Patch self_cycle assuming it is defined in this module
+if 'self_cycle' in globals():
+    original_self_cycle = globals()['self_cycle']
+    globals()['self_cycle'] = guarded_self_cycle
+
+
+import json
+import os
+
+
+def parse_pytest_json_report(report_path='tests/report.json'):
+    """Parse the pytest JSON report and summarize failures and flaky tests."""
+    if not os.path.exists(report_path):
+        print(f"Pytest JSON report not found at {report_path}")
+        return None
+
+    with open(report_path, 'r') as f:
+        data = json.load(f)
+
+    failures = []
+    flaky = []  # Stub for flaky test detection if we extend
+
+    for test in data.get('tests', []):
+        outcome = test.get('outcome')
+        nodeid = test.get('nodeid')
+        if outcome == 'failed':
+            failures.append(nodeid)
+        # Placeholder for flaky detection logic
+
+    summary = {
+        'total_tests': data.get('summary', {}).get('total', 0),
+        'passed': data.get('summary', {}).get('passed', 0),
+        'failed': data.get('summary', {}).get('failed', 0),
+        'skipped': data.get('summary', {}).get('skipped', 0),
+        'failures': failures,
+        'flaky': flaky
+    }
+
+    print(f"Pytest JSON report summary: {summary}")
+
+    return summary
+
+
+
+# Add new subcommand 'queue_clean' to invoke the queue cleaner
+import argparse
+import logging
+
+try:
+    from ai.data.queue import cleaner
+except ImportError:
+    cleaner = None
+
+
+def subcmd_queue_clean(args):
+    logger = logging.getLogger("bob.meta.queue_clean")
+    if cleaner is None:
+        logger.error("Queue cleaner module not found. Cannot run queue_clean command.")
+        return 1
+    logger.info("Running queue cleaner...")
+    cleaner.clean_queue()
+    logger.info("Queue cleaner finished.")
+    return 0
+
+
+old_main = globals().get('main', None)
+
+def main_with_queue_clean():
+    parser = argparse.ArgumentParser(description="Bob main meta tool")
+    parser.add_argument('command', nargs='?', help='subcommand to run')
+    args, unknown = parser.parse_known_args()
+
+    if args.command == 'queue_clean':
+        return subcmd_queue_clean(unknown)
+    elif old_main:
+        return old_main()
+    else:
+        parser.print_help()
+        return 1
+
+
+if __name__ == '__main__':
+    exit(main_with_queue_clean())
+

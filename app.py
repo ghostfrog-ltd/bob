@@ -1657,3 +1657,33 @@ if __name__ == "__main__":
     if run_tests_on_startup():
         print("[Bob/Chad] Web UI starting on http://127.0.0.1:8765/chat")
         app.run(host="127.0.0.1", port=8765)
+
+
+from flask import request, jsonify
+
+# Add endpoint to fetch chat messages with paging
+@app.route('/chat/messages')
+def get_chat_messages():
+    # Assuming messages are stored in a list or DB, here we simulate with a function get_messages(offset, limit)
+    try:
+        offset = int(request.args.get('offset', 0))
+        limit = int(request.args.get('limit', 20))
+    except ValueError:
+        return jsonify({'error': 'Invalid offset or limit'}), 400
+
+    messages = get_messages(offset=offset, limit=limit)  # Implement or adjust get_messages accordingly
+    total_count = get_total_message_count()  # Implement or adjust this too
+
+    return jsonify({'messages': messages, 'offset': offset, 'limit': limit, 'total': total_count})
+
+
+# Stub implementations for this example (adjust if the project has a different data source)
+def get_messages(offset=0, limit=20):
+    # This should retrieve from actual chat history storage
+    # Here just simulate with sample data
+    all_messages = app.config.get('CHAT_HISTORY', [])
+    return all_messages[offset:offset+limit]
+
+def get_total_message_count():
+    return len(app.config.get('CHAT_HISTORY', []))
+
