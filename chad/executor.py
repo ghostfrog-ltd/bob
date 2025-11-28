@@ -1,401 +1,18 @@
 #!/usr/bin/env python3
-# app.py – GhostFrog Bob ↔ Chad message bus + UI (PoC)
+from __future__ import annotations
 
-import json
+import mimetypes
 import os
 import smtplib
-import mimetypes
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from email.message import EmailMessage
-from datetime import datetime, date, timezone
 from pathlib import Path
-
-from flask import Flask, jsonify, request, render_template_string
-from dotenv import load_dotenv
-from openai import OpenAI
-
-# Load .env (OPENAI_API_KEY, BOB_MODEL, SMTP_*, etc.)
-load_dotenv()
-
-# OpenAI client for Bob (cloud reasoner)
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-BOB_MODEL = os.getenv("BOB_MODEL", "gpt-4.1-mini")
-
-# ---------------------------------------------------------------------------
-# Paths / constants
-# ---------------------------------------------------------------------------
-
-AI_ROOT = Path(__file__).resolve().parent  # project root
-DATA_ROOT = AI_ROOT / "data"
-QUEUE_DIR = DATA_ROOT / "queue"
-SCRATCH_DIR = DATA_ROOT / "scratch"
-SEQ_FILE = DATA_ROOT / "seq.txt"
-MARKDOWN_NOTES_DIR = DATA_ROOT / "notes"
-
-# UI folder
-UI_ROOT = AI_ROOT / "ui"
-CHAT_TEMPLATE_PATH = UI_ROOT / "chat_ui.html"
-
-DATA_ROOT.mkdir(parents=True, exist_ok=True)
-QUEUE_DIR.mkdir(parents=True, exist_ok=True)
-SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
-MARKDOWN_NOTES_DIR.mkdir(parents=True, exist_ok=True)
-
-# Project jail – Bob/Chad are ONLY allowed to touch files inside here
-ENV_PROJECT_JAIL = os.getenv("ENV_PROJECT_JAIL")
-if ENV_PROJECT_JAIL:
-    PROJECT_ROOT = Path(ENV_PROJECT_JAIL).resolve()
-else:
-    PROJECT_ROOT = AI_ROOT.parent.resolve()
+from typing import Any, Dict, List, Optional
 
 
 # ---------------------------------------------------------------------------
-# Schema Bob uses for plans
-# ---------------------------------------------------------------------------
-
-BOB_PLAN_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "task_type": {
-            "type": "string",
-            "enum": ["codemod", "analysis", "tool", "chat"],
-        },
-        "summary": {"type": "string"},
-        "analysis_file": {
-            "type": "string",
-            "default": "",
-        },
-        "edits": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "file": {"type": "string"},
-                    "operation": {
-                        "type": "string",
-                        "enum": [
-                            "prepend_comment",
-                            "create_or_overwrite_file",
-                            "append_to_bottom",
-                        ],
-                    },
-                    "content": {"type": "string"},
-                },
-                "required": ["file", "operation", "content"],
-                "additionalProperties": False,
-            },
-        },
-        "tool": {
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "enum": [
-                        "get_current_datetime",
-                        "list_files",
-                        "read_file",
-                        "create_markdown_note",
-                        "append_to_markdown_note",
-                        "send_email",
-                    ],
-                },
-                "args": {
-                    "type": "object",
-                    "additionalProperties": True,
-                    "default": {},
-                },
-            },
-            "default": {},
-        },
-    },
-    "required": ["task_type", "summary", "analysis_file", "edits"],
-    "additionalProperties": False,
-}
-
-
-# ---------------------------------------------------------------------------
-# ID generator: 00001_YYYY-MM-DD
-# ---------------------------------------------------------------------------
-
-def next_message_id() -> tuple[str, str, str]:
-    """
-    Returns (id_str, date_str, base_name) like:
-      ("00001", "2025-11-23", "00001_2025-11-23")
-    """
-    today = date.today().strftime("%Y-%m-%d")
-
-    if SEQ_FILE.exists():
-        try:
-            current = int(SEQ_FILE.read_text(encoding="utf-8").strip() or "0")
-        except ValueError:
-            current = 0
-    else:
-        current = 0
-
-    new_val = current + 1
-    SEQ_FILE.write_text(str(new_val), encoding="utf-8")
-
-    id_str = f"{new_val:05d}"
-    base = f"{id_str}_{today}"
-    return id_str, today, base
-
-
-# ---------------------------------------------------------------------------
-# "Bob" – reasoning / planning layer
-# ---------------------------------------------------------------------------
-
-def bob_build_plan(
-    id_str: str,
-    date_str: str,
-    base: str,
-    user_text: str,
-    tools_enabled: bool = True,
-) -> dict:
-    """
-    Bob builds a structured plan for Chad.
-    """
-    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    api_key = os.getenv("OPENAI_API_KEY")
-
-    # If no key, fall back to a simple stub
-    if not api_key:
-        plan: dict = {
-            "id": id_str,
-            "date": date_str,
-            "created_at": now,
-            "actor": "bob",
-            "kind": "plan",
-            "raw_user_text": user_text,
-            "task": {
-                "type": "chat",
-                "summary": f"(STUB – no OPENAI_API_KEY) Handle user request: {user_text}",
-                "analysis_file": "",
-                "edits": [],
-                "tool": {},
-            },
-        }
-        (QUEUE_DIR / f"{base}.plan.json").write_text(
-            json.dumps(plan, indent=2), encoding="utf-8"
-        )
-        return plan
-
-    if tools_enabled:
-        tool_mode_text = (
-            "Tools ARE ENABLED for this request. You should choose 'tool' whenever "
-            "the user is asking you to interact with the live project/filesystem, "
-            "write notes, or send email — even if they do NOT mention tool names.\n"
-        )
-    else:
-        tool_mode_text = (
-            "Tools ARE DISABLED for this request. You MUST NOT choose task_type "
-            "'tool', and you MUST leave the 'tool' object empty. Handle the "
-            "request purely as 'chat', 'analysis', or 'codemod'.\n"
-        )
-
-    try:
-        system_prompt = (
-            "You are Bob, a senior reasoning model orchestrating a local coder called Chad.\n"
-            "The user is working on a Python / GhostFrog project.\n\n"
-            # (long system prompt omitted here for brevity – keep your existing one)
-            f"{json.dumps(BOB_PLAN_SCHEMA, indent=2)}\n"
-            "Do not add keys or text outside of the JSON.\n\n"
-            "**FAST EMAIL RULE**\n"
-            "If the user mentions 'email' and a file or markdown note was just created or viewed,\n"
-            "you MUST choose the 'send_email' tool and MUST attach the file automatically.\n"
-            "NEVER ask for confirmation when sending emails triggered by notes.\n"
-        )
-
-        resp = openai_client.responses.create(
-            model=BOB_MODEL,
-            input=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_text},
-            ],
-            text={"format": {"type": "json_object"}},
-        )
-
-        raw = (resp.output_text or "").strip()
-        first = raw.find("{")
-        last = raw.rfind("}")
-        if first != -1 and last != -1:
-            raw = raw[first:last + 1]
-
-        body = json.loads(raw)
-
-        task_type = body.get("task_type", "analysis")
-        summary = body.get("summary", "").strip() or user_text
-        edits = body.get("edits") or []
-        analysis_file = body.get("analysis_file") or ""
-        tool_obj = body.get("tool") or {}
-
-    except Exception as e:
-        task_type = "analysis"
-        summary = f"(STUB – OpenAI error: {e!r}) Handle user request: {user_text}"
-        edits = []
-        analysis_file = ""
-        tool_obj = {}
-
-    plan: dict = {
-        "id": id_str,
-        "date": date_str,
-        "created_at": now,
-        "actor": "bob",
-        "kind": "plan",
-        "raw_user_text": user_text,
-        "task": {
-            "type": task_type,
-            "analysis_file": analysis_file,
-            "summary": summary,
-            "edits": edits,
-            "tool": tool_obj,
-        },
-    }
-
-    (QUEUE_DIR / f"{base}.plan.json").write_text(
-        json.dumps(plan, indent=2), encoding="utf-8"
-    )
-    return plan
-
-
-def bob_refine_codemod_with_files(
-    user_text: str,
-    base_task: dict,
-    file_contexts: dict[str, str],
-) -> dict:
-    """
-    Second-pass planner for codemods.
-    """
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return base_task
-
-    if not file_contexts:
-        return base_task
-
-    files_blob_lines: list[str] = []
-    for rel_path, contents in file_contexts.items():
-        files_blob_lines.append(
-            f"===== FILE: {rel_path} =====\n{contents}\n===== END FILE =====\n"
-        )
-    files_blob = "\n".join(files_blob_lines)
-
-    refine_prompt = (
-        "You are Bob, refining your previous codemod plan now that you have the "
-        "actual contents of the files from disk.\n\n"
-        f"{json.dumps(BOB_PLAN_SCHEMA, indent=2)}\n\n"
-        "Return ONLY a single JSON object. Do NOT include any extra commentary.\n"
-    )
-
-    try:
-        resp = openai_client.responses.create(
-            model=BOB_MODEL,
-            input=[
-                {"role": "system", "content": refine_prompt},
-                {
-                    "role": "user",
-                    "content": (
-                        f"User request:\n{user_text}\n\n"
-                        f"Here are the current file contents you may edit:\n\n{files_blob}"
-                    ),
-                },
-            ],
-            text={"format": {"type": "json_object"}},
-        )
-
-        raw = (resp.output_text or "").strip()
-        first = raw.find("{")
-        last = raw.rfind("}")
-        if first != -1 and last != -1:
-            raw = raw[first:last + 1]
-
-        body = json.loads(raw)
-
-        summary = body.get("summary", base_task.get("summary", "")).strip()
-        edits = body.get("edits") or []
-
-        refined_task = {
-            "type": "codemod",
-            "summary": summary or base_task.get("summary", ""),
-            "analysis_file": "",
-            "edits": edits,
-            "tool": {},
-        }
-        return refined_task
-
-    except Exception as e:
-        fallback = dict(base_task)
-        fallback.setdefault(
-            "summary",
-            f"{base_task.get('summary', '')} (codemod refinement failed: {e!r})",
-        )
-        return fallback
-
-
-def bob_simple_chat(user_text: str) -> str:
-    """
-    Simple Q&A mode for Bob when no file is involved.
-    """
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return (
-            "You asked: {!r}. I can't call OpenAI because OPENAI_API_KEY is "
-            "not configured, but normally I'd answer this directly here."
-        ).format(user_text)
-
-    base_prompt = (
-        "You are Bob, a helpful AI assistant for a developer working on the "
-        "GhostFrog project.\n"
-        "The user is asking a general question (no specific file needed, no live tools).\n"
-        "Answer directly and concisely in plain language."
-    )
-
-    try:
-        resp = openai_client.responses.create(
-            model=BOB_MODEL,
-            input=[
-                {"role": "system", "content": base_prompt},
-                {"role": "user", "content": user_text},
-            ],
-        )
-        text = (resp.output_text or "").strip()
-        return text or "I couldn't generate a detailed answer."
-    except Exception as e:
-        return f"I tried to answer but hit an OpenAI error: {e!r}"
-
-
-def bob_answer_with_context(user_text: str, plan: dict, snippet: str) -> str:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return "I’d like to review the file, but there is no OPENAI_API_KEY configured."
-
-    if not snippet:
-        base_prompt = (
-            "The user asked you about code, but Chad could not provide the file contents.\n"
-            "Answer as best you can in general terms."
-        )
-    else:
-        base_prompt = (
-            "You are Bob, reviewing code that Chad read from disk.\n"
-            "The user asked a question about this file.\n\n"
-            "Respond with a friendly, practical review."
-        )
-
-    try:
-        resp = openai_client.responses.create(
-            model=BOB_MODEL,
-            input=[
-                {"role": "system", "content": base_prompt},
-                {"role": "user", "content": f"User request:\n{user_text}"},
-                {"role": "user", "content": f"File contents snippet:\n\n{snippet}"},
-            ],
-        )
-        text = (resp.output_text or "").strip()
-        return text or "I looked at the file but couldn't generate a detailed review."
-    except Exception as e:
-        return f"I tried to review the file but hit an OpenAI error: {e!r}"
-
-
-# ---------------------------------------------------------------------------
-# "Chad" – local executor layer
+# Small helpers
 # ---------------------------------------------------------------------------
 
 def _normalize_newlines(text: str) -> str:
@@ -429,7 +46,8 @@ def _contains_suspicious_control_chars(text: str) -> bool:
 def _strip_suspicious_control_chars(text: str) -> str:
     """
     Lightweight strip for a couple of problematic chars that have shown up
-    in practice.
+    in practice. We keep this separate from __strip_suspicious_control_chars
+    so we can choose behaviour depending on context.
     """
     return text.replace("\x0b", "").replace("\x0c", "")
 
@@ -454,6 +72,10 @@ def __strip_suspicious_control_chars(text: str) -> str:
 def _safe_write_text(path: Path, text: str) -> None:
     """
     Write UTF-8 text with LF newlines only.
+
+    - keeps encoding consistent
+    - keeps line endings consistent
+    - avoids BOMs
     """
     if not isinstance(text, str):
         text = str(text)
@@ -461,6 +83,7 @@ def _safe_write_text(path: Path, text: str) -> None:
     text = _normalize_newlines(text)
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    # newline='\n' forces LF on disk
     with path.open("w", encoding="utf-8", newline="\n") as f:
         f.write(text)
 
@@ -480,17 +103,17 @@ def _detect_comment_prefix(path: Path) -> str:
     return "# "
 
 
-def _resolve_in_project_jail(relative_path: str) -> Path | None:
+def _resolve_in_project_jail(relative_path: str, project_root: Path) -> Path | None:
     """
-    Resolve a relative path against PROJECT_ROOT, enforcing the jail.
+    Resolve a relative path against project_root, enforcing the jail.
 
     Returns a Path or None if the path escapes the jail.
     """
     if not relative_path:
         relative_path = "."
-    target = (PROJECT_ROOT / relative_path).resolve()
+    target = (project_root / relative_path).resolve()
     try:
-        target.relative_to(PROJECT_ROOT)
+        target.relative_to(project_root)
     except ValueError:
         return None
     return target
@@ -512,25 +135,34 @@ def _slugify_for_markdown(title: str) -> str:
     return base
 
 
+# ---------------------------------------------------------------------------
+# Main entrypoint – used by tests and by app.py
+# ---------------------------------------------------------------------------
+
 def chad_execute_plan(
     id_str: str,
     date_str: str,
     base: str,
     plan: dict,
+    *,
+    project_root: Path,
+    queue_dir: Path,
+    scratch_dir: Path,
+    notes_dir: Path,
 ) -> dict:
     """
     Chad executes Bob's plan.
 
-    This version is the one tests call directly (bob_app.chad_execute_plan).
-
-    - Uses module-level PROJECT_ROOT, SCRATCH_DIR, MARKDOWN_NOTES_DIR.
-    - For task.type == 'tool', runs local tools (datetime, FS, notes, SMTP).
-    - Always returns an exec_report dict; never returns None.
+    Rules:
+      - Only acts on task.type == 'codemod' for file edits.
+      - For 'tool', runs a local tool (e.g. system datetime, list_files, SMTP).
+      - For 'analysis', reads a file for Bob to review.
+      - Only edits files INSIDE project_root.
+      - Returns a dict exec_report; NEVER returns None.
     """
-    # Ensure dirs exist (tests will monkeypatch these globals)
-    SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
-    QUEUE_DIR.mkdir(parents=True, exist_ok=True)
-    MARKDOWN_NOTES_DIR.mkdir(parents=True, exist_ok=True)
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    notes_dir.mkdir(parents=True, exist_ok=True)
 
     now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -542,7 +174,7 @@ def chad_execute_plan(
     touched: list[str] = []
 
     # ------------------------------------------------------------------
-    # TOOL branch – used heavily by tests
+    # TOOL branch – use local system capabilities (e.g. datetime, FS, SMTP)
     # ------------------------------------------------------------------
     if task_type == "tool":
         tool_name = tool_obj.get("name") or ""
@@ -566,7 +198,7 @@ def chad_execute_plan(
             except (TypeError, ValueError):
                 max_entries = 200
 
-            base_path = _resolve_in_project_jail(rel_path)
+            base_path = _resolve_in_project_jail(rel_path, project_root)
             if base_path is None or not base_path.exists():
                 message = (
                     f"Chad tried to list_files at {rel_path!r} but the path was invalid "
@@ -582,7 +214,7 @@ def chad_execute_plan(
                         if count >= max_entries:
                             break
                         try:
-                            rel = str(path.relative_to(PROJECT_ROOT))
+                            rel = str(path.relative_to(project_root))
                         except ValueError:
                             continue
                         if path.is_dir():
@@ -603,7 +235,7 @@ def chad_execute_plan(
                         if count >= max_entries:
                             break
                         try:
-                            rel = str(path.relative_to(PROJECT_ROOT))
+                            rel = str(path.relative_to(project_root))
                         except ValueError:
                             continue
                         if path.is_dir():
@@ -621,7 +253,7 @@ def chad_execute_plan(
                         count += 1
                 else:
                     try:
-                        rel = str(base_path.relative_to(PROJECT_ROOT))
+                        rel = str(base_path.relative_to(project_root))
                     except ValueError:
                         rel = base_path.name
                     try:
@@ -661,7 +293,7 @@ def chad_execute_plan(
             except (TypeError, ValueError):
                 max_chars = 16000
 
-            target_path = _resolve_in_project_jail(rel_path)
+            target_path = _resolve_in_project_jail(rel_path, project_root)
             if target_path is None or not target_path.exists() or not target_path.is_file():
                 message = (
                     f"Chad tried to read_file {rel_path!r} but it does not exist, "
@@ -688,7 +320,7 @@ def chad_execute_plan(
             title = str(tool_args.get("title") or tool_args.get("name") or "").strip()
             content = str(tool_args.get("content") or "")
             slug = _slugify_for_markdown(title or "note")
-            note_path = MARKDOWN_NOTES_DIR / f"{slug}.md"
+            note_path = notes_dir / f"{slug}.md"
 
             if tool_name == "create_markdown_note":
                 note_path.write_text(content, encoding="utf-8")
@@ -736,19 +368,19 @@ def chad_execute_plan(
                 attachments = []
 
             auto_note = False
-            note_path: Path | None = None
-            note_rel_display: str | None = None
+            note_path: Optional[Path] = None
+            note_rel_display: Optional[str] = None
 
             # Auto-attach most recent markdown note if none supplied at all
             if not attachments and not attachments_in_args:
-                latest: Path | None = None
-                latest_mtime: float | None = None
-                for p in MARKDOWN_NOTES_DIR.glob("*.md"):
+                latest = None
+                latest_mtime = None
+                for p in notes_dir.glob("*.md"):
                     try:
                         mtime = p.stat().st_mtime
                     except OSError:
                         continue
-                    if latest is None or mtime > (latest_mtime or 0):
+                    if latest is None or mtime > latest_mtime:
                         latest = p
                         latest_mtime = mtime
 
@@ -757,7 +389,7 @@ def chad_execute_plan(
                     note_path = latest
                     note_rel_display = f"notes/{latest.name}"
                     try:
-                        attachment_rel = str(latest.relative_to(PROJECT_ROOT))
+                        attachment_rel = str(latest.relative_to(project_root))
                     except ValueError:
                         attachment_rel = str(latest)
                     attachments = [attachment_rel]
@@ -810,7 +442,7 @@ def chad_execute_plan(
 
                         for rel in attachments:
                             rel_str = str(rel)
-                            attach_path = _resolve_in_project_jail(rel_str)
+                            attach_path = _resolve_in_project_jail(rel_str, project_root)
                             if attach_path is None or not attach_path.exists():
                                 continue
                             mime_type, _ = mimetypes.guess_type(str(attach_path))
@@ -865,7 +497,7 @@ def chad_execute_plan(
             )
             tool_result = ""
 
-        scratch_file = SCRATCH_DIR / f"{base}.txt"
+        scratch_file = scratch_dir / f"{base}.txt"
         scratch_file.write_text(
             "GhostFrog Chad tool execution\n"
             f"ID: {base}\n"
@@ -887,17 +519,17 @@ def chad_execute_plan(
             "analysis_file": None,
             "analysis_snippet": "",
             "tool_name": tool_name,
-            # tests look at these:
+            # IMPORTANT for tests: expose args & result
             "tool_args": tool_args,
             "tool_result": tool_result,
             "message": message,
         }
-        exec_path = QUEUE_DIR / f"{base}.exec.json"
-        exec_path.write_text(json.dumps(exec_report, indent=2), encoding="utf-8")
+        exec_path = queue_dir / f"{base}.exec.json"
+        exec_path.write_text(str(exec_report), encoding="utf-8")
         return exec_report
 
     # ------------------------------------------------------------------
-    # ANALYSIS branch – minimal for now
+    # ANALYSIS branch – minimal implementation (tests focus on tools)
     # ------------------------------------------------------------------
     if task_type != "codemod":
         analysis_file = task.get("analysis_file") or ""
@@ -905,18 +537,18 @@ def chad_execute_plan(
         target_rel = None
 
         if analysis_file:
-            target_path = (PROJECT_ROOT / analysis_file).resolve()
+            target_path = (project_root / analysis_file).resolve()
             try:
-                target_path.relative_to(PROJECT_ROOT)
+                target_path.relative_to(project_root)
             except ValueError:
                 target_path = None
 
             if target_path is not None and target_path.exists():
                 raw = target_path.read_text(encoding="utf-8")
                 analysis_snippet = raw[:16000]
-                target_rel = str(target_path.relative_to(PROJECT_ROOT))
+                target_rel = str(target_path.relative_to(project_root))
 
-        scratch_file = SCRATCH_DIR / f"{base}.txt"
+        scratch_file = scratch_dir / f"{base}.txt"
         scratch_file.write_text(
             "GhostFrog Chad analysis execution\n"
             f"ID: {base}\n"
@@ -941,15 +573,17 @@ def chad_execute_plan(
                 else "Chad performed analysis-only; no file was read."
             ),
         }
-        exec_path = QUEUE_DIR / f"{base}.exec.json"
-        exec_path.write_text(json.dumps(exec_report, indent=2), encoding="utf-8")
+        exec_path = queue_dir / f"{base}.exec.json"
+        exec_path.write_text(str(exec_report), encoding="utf-8")
         return exec_report
 
     # ------------------------------------------------------------------
-    # CODEMOD branch – we keep simple for now (tests focus on tools)
+    # CODEMOD branch – stubbed enough for now (tests are about tools)
     # ------------------------------------------------------------------
     edit_logs: list[dict] = []
 
+    # In future we can mirror your full codemod implementation.
+    # For now, we just record that we saw edits.
     for edit in edits:
         file_rel = edit.get("file")
         op = edit.get("operation")
@@ -963,9 +597,9 @@ def chad_execute_plan(
             })
             continue
 
-        target_path = (PROJECT_ROOT / file_rel).resolve()
+        target_path = (project_root / file_rel).resolve()
         try:
-            target_path.relative_to(PROJECT_ROOT)
+            target_path.relative_to(project_root)
         except ValueError:
             edit_logs.append({
                 "file": file_rel,
@@ -1007,7 +641,7 @@ def chad_execute_plan(
                 continue
 
             _safe_write_text(target_path, new_text)
-            touched.append(str(target_path.relative_to(PROJECT_ROOT)))
+            touched.append(str(target_path.relative_to(project_root)))
             edit_logs.append({
                 "file": file_rel,
                 "operation": op,
@@ -1038,7 +672,7 @@ def chad_execute_plan(
                 continue
 
             _safe_write_text(target_path, new_text)
-            touched.append(str(target_path.relative_to(PROJECT_ROOT)))
+            touched.append(str(target_path.relative_to(project_root)))
             edit_logs.append({
                 "file": file_rel,
                 "operation": op,
@@ -1070,7 +704,7 @@ def chad_execute_plan(
                 continue
 
             _safe_write_text(target_path, new_text)
-            touched.append(str(target_path.relative_to(PROJECT_ROOT)))
+            touched.append(str(target_path.relative_to(project_root)))
             edit_logs.append({
                 "file": file_rel,
                 "operation": op,
@@ -1084,7 +718,7 @@ def chad_execute_plan(
                 "reason": f"unknown operation {op!r}",
             })
 
-    scratch_file = SCRATCH_DIR / f"{base}.txt"
+    scratch_file = scratch_dir / f"{base}.txt"
     scratch_file.write_text(
         "GhostFrog Chad execution\n"
         f"ID: {base}\n"
@@ -1092,7 +726,7 @@ def chad_execute_plan(
         "Touched files:\n"
         + ("\n".join(touched) if touched else "(none)")
         + "\n\nEdit logs:\n"
-        + (json.dumps(edit_logs, indent=2) if edit_logs else "(none)")
+        + (str(edit_logs) if edit_logs else "(none)")
         + "\n",
         encoding="utf-8",
     )
@@ -1121,276 +755,6 @@ def chad_execute_plan(
         "message": message,
     }
 
-    exec_path = QUEUE_DIR / f"{base}.exec.json"
-    exec_path.write_text(json.dumps(exec_report, indent=2), encoding="utf-8")
+    exec_path = queue_dir / f"{base}.exec.json"
+    exec_path.write_text(str(exec_report), encoding="utf-8")
     return exec_report
-
-
-# ---------------------------------------------------------------------------
-# Flask app + routes
-# ---------------------------------------------------------------------------
-
-app = Flask(__name__)
-
-
-@app.route("/chat", methods=["GET"])
-def chat_page():
-    """
-    Serve the main chat UI from ui/chat_ui.html.
-    """
-    if CHAT_TEMPLATE_PATH.exists():
-        html = CHAT_TEMPLATE_PATH.read_text(encoding="utf-8")
-    else:
-        html = "<h1>GhostFrog Bob/Chad UI</h1><p>chat_ui.html is missing.</p>"
-    return render_template_string(html)
-
-
-@app.route("/api/chat", methods=["POST"])
-def api_chat():
-    """
-    One round-trip for:
-      user → Bob(plan) → Chad(exec) → Bob(summary).
-
-    Bob and Chad are currently synchronous.
-    """
-    data = request.get_json(silent=True) or {}
-    raw_message = (data.get("message") or "").strip()
-
-    if not raw_message:
-        return jsonify({
-            "messages": [{"role": "bob", "text": "I didn’t receive any command."}]
-        })
-
-    message = raw_message
-    tools_enabled = True
-    prefix = "#bob no-tools"
-    if message.lower().startswith(prefix):
-        tools_enabled = False
-        message = message[len(prefix):].lstrip()
-
-    if not message:
-        return jsonify({
-            "messages": [{"role": "bob", "text": "I didn’t receive any command."}]
-        })
-
-    id_str, date_str, base = next_message_id()
-
-    # Persist user message
-    user_path = QUEUE_DIR / f"{base}.user.txt"
-    user_path.write_text(message + "\n", encoding="utf-8")
-
-    # Build plan (no QUEUE_DIR param!)
-    plan = bob_build_plan(
-        id_str,
-        date_str,
-        base,
-        message,
-        tools_enabled=tools_enabled,
-    )
-
-    # Optional codemod refinement
-    task = plan.get("task") or {}
-    if task.get("type") == "codemod":
-        original_edits = task.get("edits") or []
-        files_for_context: set[str] = set()
-
-        for e in original_edits:
-            rel = e.get("file")
-            if rel:
-                files_for_context.add(rel)
-
-        file_contexts: dict[str, str] = {}
-        for rel in files_for_context:
-            target = (PROJECT_ROOT / rel).resolve()
-            try:
-                target.relative_to(PROJECT_ROOT)
-            except ValueError:
-                continue
-            if not target.exists() or not target.is_file():
-                continue
-            try:
-                raw = target.read_text(encoding="utf-8")
-            except Exception:
-                continue
-            file_contexts[rel] = raw
-
-        if file_contexts:
-            refined_task = bob_refine_codemod_with_files(
-                user_text=message,
-                base_task=task,
-                file_contexts=file_contexts,
-            )
-            plan["task"] = refined_task
-
-    # Execute the plan (uses module-level PROJECT_ROOT etc.)
-    exec_report = chad_execute_plan(
-        id_str,
-        date_str,
-        base,
-        plan,
-    )
-
-    task = plan.get("task") or {}
-    task_type = task.get("type", "analysis")
-    summary = task.get("summary", message)
-    analysis_file = task.get("analysis_file") or ""
-    edits = task.get("edits") or []
-    tool_obj = task.get("tool") or {}
-
-    ui_messages = [
-        {"role": "bob", "text": f"Bob: thinking… (id {base})"},
-        {"role": "bob", "text": f"Bob: Plan → {summary}"},
-    ]
-
-    # 1) TOOL tasks
-    if task_type == "tool":
-        tool_name = tool_obj.get("name") or exec_report.get("tool_name") or ""
-        tool_result = exec_report.get("tool_result", "")
-        tool_message = exec_report.get("message", "Chad ran a tool.")
-
-        if tool_name == "send_email" and tool_result:
-            ui_messages.append({"role": "bob", "text": tool_result})
-            ui_messages.append({"role": "chad", "text": tool_message})
-        else:
-            ui_messages.append({"role": "chad", "text": tool_message})
-            if tool_result:
-                ui_messages.append({"role": "bob", "text": tool_result})
-            else:
-                ui_messages.append({
-                    "role": "bob",
-                    "text": "The tool did not return any result.",
-                })
-
-        ui_messages.append({
-            "role": "bob",
-            "text": (
-                "Bob: Done (tool).\n"
-                f"Tool: {tool_name or '(none)'}\n"
-                f"Files created:\n"
-                f"  - data/queue/{base}.user.txt\n"
-                f"  - data/queue/{base}.plan.json\n"
-                f"  - data/queue/{base}.exec.json\n"
-                f"Scratch note: data/scratch/{base}.txt"
-            ),
-        })
-
-    # 2) CHAT-only (no analysis_file, no edits, no tool)
-    elif not analysis_file and not edits and not tool_obj:
-        answer = bob_simple_chat(message)
-        ui_messages.append({"role": "bob", "text": answer})
-
-        ui_messages.append({
-            "role": "bob",
-            "text": (
-                "Bob: Done (chat-only).\n"
-                f"Files created:\n"
-                f"  - data/queue/{base}.user.txt\n"
-                f"  - data/queue/{base}.plan.json\n"
-                f"  - data/queue/{base}.exec.json\n"
-                f"Scratch note: data/scratch/{base}.txt"
-            ),
-        })
-
-    # 3) ANALYSIS
-    elif task_type == "analysis":
-        ui_messages.append({
-            "role": "chad",
-            "text": exec_report.get("message", "Chad fetched file for Bob."),
-        })
-
-        snippet = exec_report.get("analysis_snippet", "")
-        review = bob_answer_with_context(message, plan, snippet)
-        ui_messages.append({"role": "bob", "text": review})
-
-        ui_messages.append({
-            "role": "bob",
-            "text": (
-                "Bob: Done (analysis).\n"
-                f"Files created:\n"
-                f"  - data/queue/{base}.user.txt\n"
-                f"  - data/queue/{base}.plan.json\n"
-                f"  - data/queue/{base}.exec.json\n"
-                f"Scratch note: data/scratch/{base}.txt"
-            ),
-        })
-
-    # 4) CODEMOD
-    else:
-        touched_files = exec_report.get("touched_files") or []
-
-        ui_messages.append({"role": "chad", "text": "Chad: working on Bob's plan…"})
-        ui_messages.append({
-            "role": "chad",
-            "text": exec_report.get("message", "Chad executed Bob's plan."),
-        })
-
-        if touched_files:
-            pretty = "\n".join(f" - {f}" for f in touched_files)
-            ui_messages.append({"role": "chad", "text": f"Chad edited:\n{pretty}"})
-
-            # Show first edited file as preview
-            first_rel = touched_files[0]
-            try:
-                target_path = (PROJECT_ROOT / first_rel).resolve()
-                target_path.relative_to(PROJECT_ROOT)
-                content = target_path.read_text(encoding="utf-8")
-                if len(content) > 16000:
-                    content_snippet = content[:16000] + "\n\n... (truncated)"
-                else:
-                    content_snippet = content
-                ui_messages.append({
-                    "role": "bob",
-                    "text": f"Here is the updated {first_rel}:\n\n{content_snippet}",
-                })
-            except Exception:
-                pass
-
-        ui_messages.append({
-            "role": "bob",
-            "text": (
-                "Bob: Done.\n"
-                f"Files created:\n"
-                f"  - data/queue/{base}.user.txt\n"
-                f"  - data/queue/{base}.plan.json\n"
-                f"  - data/queue/{base}.exec.json\n"
-                f"Scratch note: data/scratch/{base}.txt"
-            ),
-        })
-
-    # FINAL RESPONSE
-    return jsonify({"messages": ui_messages})
-
-
-
-# ---------------------------------------------------------------------------
-# Entry point – run tests then start app
-# ---------------------------------------------------------------------------
-
-def run_tests_on_startup() -> bool:
-    """
-    Run the pytest suite before starting the web app.
-
-    Returns:
-        True  -> tests passed or pytest not installed (start server)
-        False -> tests failed (do NOT start server)
-    """
-    try:
-        import pytest
-    except ImportError:
-        print("[Bob/Chad] pytest not installed; skipping tests.")
-        return True
-
-    print("[Bob/Chad] Running test suite (pytest) before starting server...")
-    result = pytest.main(["-q", "tests"])
-    if result != 0:
-        print(f"[Bob/Chad] Tests FAILED (exit code {result}); not starting server.")
-        return False
-
-    print("[Bob/Chad] Tests passed; starting server.")
-    return True
-
-
-if __name__ == "__main__":
-    if run_tests_on_startup():
-        print("[Bob/Chad] Web UI starting on http://127.0.0.1:8765/chat")
-        app.run(host="127.0.0.1", port=8765)

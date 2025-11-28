@@ -2,7 +2,7 @@
 """
 Basic tests for Chad's tool execution layer.
 
-Run from /ai with:
+Run from project root with:
     pytest -q
 
 These tests call chad_execute_plan() directly with synthetic plans.
@@ -14,7 +14,7 @@ import os
 
 import pytest
 
-import app as bob_app  # app.py in the same directory
+import app as bob_app  # app.py at project root
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -348,6 +348,8 @@ def test_send_email_missing_smtp(monkeypatch, tmp_path):
     ]:
         monkeypatch.delenv(key, raising=False)
 
+    monkeypatch.setenv("SMTP_TO", "dest@example.com")
+
     monkeypatch.setattr(bob_app, "SCRATCH_DIR", tmp_path / "scratch", raising=False)
     bob_app.SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -434,8 +436,7 @@ def test_send_email_forced_to_env(monkeypatch, tmp_path):
         },
     )
 
-    report = bob_app.chad_execute_plan("00001", "2025-11-23", "00001_2025-11-23", plan)
+    report = bob_app.chad_execute_plan(BASE_ID, BASE_DATE, BASE_NAME, plan)
 
     # Check that it forced the TO
     assert sent["to"] == "forced@example.com"
-
