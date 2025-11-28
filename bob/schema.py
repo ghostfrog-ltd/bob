@@ -1,3 +1,4 @@
+# bob/schema.py
 from __future__ import annotations
 
 BOB_PLAN_SCHEMA = {

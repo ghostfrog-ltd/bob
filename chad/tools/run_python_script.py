@@ -1,44 +1,55 @@
 # chad/tools/run_python_script.py
 from __future__ import annotations
+
 import subprocess
-import shlex
+import sys
 from pathlib import Path
+from typing import Any, Dict
 
-def run_python_script(path: str, timeout: int = 10) -> dict:
+
+# Adjust this the same way you do in your other tools
+PROJECT_ROOT = Path(__file__).resolve().parents[2]  # /.../ghostfrog-agentic-alert-bot-bob
+
+
+def run_python_script(args: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Safely execute a Python script inside the jail.
+    Tool: run_python_script
 
-    - Only runs files inside the project jail.
-    - Returns stdout/stderr.
-    - Timeout prevents infinite loops.
+    Args:
+      path: relative path to a Python script inside the project
+      args: optional list of string arguments
+
+    Returns:
+      {ok, returncode, stdout, stderr, script, argv}
     """
+    rel_path = args.get("path")
+    if not rel_path:
+        return {"ok": False, "error": "missing 'path' arg"}
 
-    p = Path(path).resolve()
+    extra_args = args.get("args") or []
 
-    # Jail root = project root
-    project_root = Path(__file__).resolve().parents[2]
+    script_path = (PROJECT_ROOT / rel_path).resolve()
 
-    if not str(p).startswith(str(project_root)):
-        return {
-            "ok": False,
-            "error": f"Script path '{p}' escapes jail root '{project_root}'"
-        }
-
-    if not p.exists():
-        return {"ok": False, "error": f"Script does not exist: {p}"}
-
+    # Safety: keep inside the jail
     try:
-        proc = subprocess.run(
-            ["python3", str(p)],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        return {
-            "ok": proc.returncode == 0,
-            "stdout": proc.stdout,
-            "stderr": proc.stderr,
-            "returncode": proc.returncode,
-        }
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+        script_path.relative_to(PROJECT_ROOT)
+    except ValueError:
+        return {"ok": False, "error": "script outside project root"}
+
+    if not script_path.is_file():
+        return {"ok": False, "error": f"script not found: {rel_path}"}
+
+    proc = subprocess.run(
+        [sys.executable, str(script_path), *extra_args],
+        capture_output=True,
+        text=True,
+    )
+
+    return {
+        "ok": proc.returncode == 0,
+        "script": rel_path,
+        "argv": extra_args,
+        "returncode": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+    }

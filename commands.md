@@ -1,3 +1,4 @@
+<!-- commands.md -->
 # 1) Just inspect what the meta-layer sees
 python3 -m bob.meta analyse --limit 200
 

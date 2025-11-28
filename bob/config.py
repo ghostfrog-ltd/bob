@@ -1,3 +1,4 @@
+# bob/config.py
 from __future__ import annotations
 
 import os
@@ -43,4 +44,12 @@ JAIL_ROOT = '/app/project_root'  # Example path, adjust as per actual project en
 
 # Adding config flag to enable robust file existence prechecks
 ENABLE_FILE_EXISTENCE_PRECHECKS = True
+
+
+# Add configuration for test import retries or fallback if needed
+TEST_IMPORT_RETRY_LIMIT = 1  # can be increased later if needed
+
+
+# Add configuration to define behavior for missing target files
+FILE_MISSING_BEHAVIOR = 'raise'  # Options: 'raise', 'warn', 'ignore'
 

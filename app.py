@@ -1,3 +1,4 @@
+# app.py
 #!/usr/bin/env python3
 # app.py – GhostFrog Bob ↔ Chad message bus + UI (PoC)
 
@@ -38,6 +39,7 @@ from bob.meta_log import log_history_record
 import subprocess
 import sys
 import threading
+
 
 # ---------------------------------------------------------------------------
 # Env + OpenAI client
@@ -82,6 +84,7 @@ def _auto_repair_then_retry_async() -> None:
     This is deliberately best-effort: any errors are printed but never
     break the HTTP request.
     """
+
     def _run() -> None:
         try:
             subprocess.run(
@@ -140,6 +143,7 @@ BOB_PLAN_SCHEMA = {
                         "create_markdown_note",
                         "append_to_markdown_note",
                         "send_email",
+                        "run_python_script",  # allow Bob to choose this tool
                     ],
                 },
                 "args": {
@@ -190,11 +194,11 @@ def next_message_id() -> tuple[str, str, str]:
 
 
 def bob_build_plan(
-        id_str: str,
-        date_str: str,
-        base: str,
-        user_text: str,
-        tools_enabled: bool = True,
+    id_str: str,
+    date_str: str,
+    base: str,
+    user_text: str,
+    tools_enabled: bool = True,
 ) -> dict:
     """
     Bob builds a structured plan for Chad.
@@ -244,6 +248,12 @@ def bob_build_plan(
         "  and set tool.name='send_email'. Do NOT leave task_type as 'chat'.\n"
         "  The recipient address is always taken from SMTP_TO/SMTP_TEST_TO in the\n"
         "  environment; any 'to' you put in args will be ignored by Chad.\n\n"
+        "RUN_PYTHON_SCRIPT RULE:\n"
+        "- When you choose tool.name='run_python_script', you MUST set "
+        "  tool.args.path to the script path relative to the project root "
+        "  (for example 'scripts/script_to_process_files.py').\n"
+        "- If the script needs CLI arguments, put them in tool.args.args as a "
+        "  JSON array of strings (e.g. ['--dry-run']).\n\n"
         "Decide between 'chat', 'analysis', 'tool', and 'codemod' as follows:\n"
         "- Use 'tool' for actions involving filesystem/email/notes/date queries.\n"
         "- Use 'analysis' to review a specific file without modifying it.\n"
@@ -268,7 +278,7 @@ def bob_build_plan(
         first = raw.find("{")
         last = raw.rfind("}")
         if first != -1 and last != -1:
-            raw = raw[first: last + 1]
+            raw = raw[first : last + 1]
 
         body = json.loads(raw)
 
@@ -308,9 +318,9 @@ def bob_build_plan(
 
 
 def bob_refine_codemod_with_files(
-        user_text: str,
-        base_task: dict,
-        file_contexts: dict[str, str],
+    user_text: str,
+    base_task: dict,
+    file_contexts: dict[str, str],
 ) -> dict:
     """
     Second-pass planner for codemods: refine plan given real file contents.
@@ -356,7 +366,7 @@ def bob_refine_codemod_with_files(
         first = raw.find("{")
         last = raw.rfind("}")
         if first != -1 and last != -1:
-            raw = raw[first: last + 1]
+            raw = raw[first : last + 1]
 
         body = json.loads(raw)
 
@@ -451,8 +461,6 @@ def bob_answer_with_context(user_text: str, plan: dict, snippet: str) -> str:
 def _normalize_newlines(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
-
-from pathlib import Path
 
 def _safe_read_text(target_path: str) -> str:
     """
@@ -652,9 +660,7 @@ def chad_execute_plan(id_str: str, date_str: str, base: str, plan: dict) -> dict
 
         elif tool_name == "read_file":
             rel_path = str(
-                tool_args.get("path")
-                or tool_args.get("file")
-                or ""
+                tool_args.get("path") or tool_args.get("file") or ""
             )
             try:
                 max_chars = int(tool_args.get("max_chars", 16000))
@@ -662,7 +668,11 @@ def chad_execute_plan(id_str: str, date_str: str, base: str, plan: dict) -> dict
                 max_chars = 16000
 
             target_path = _resolve_in_project_jail(rel_path)
-            if target_path is None or not target_path.exists() or not target_path.is_file():
+            if (
+                target_path is None
+                or not target_path.exists()
+                or not target_path.is_file()
+            ):
                 message = (
                     f"Chad tried to read_file {rel_path!r} but it does not exist, "
                     "is not a file, or is outside the project jail."
@@ -719,7 +729,7 @@ def chad_execute_plan(id_str: str, date_str: str, base: str, plan: dict) -> dict
         elif tool_name == "send_email":
             # FORCE TO ENV – ignore any 'to' passed in tool_args when env vars exist
             to_addr = (
-                    os.getenv("SMTP_TO") or os.getenv("SMTP_TEST_TO") or ""
+                os.getenv("SMTP_TO") or os.getenv("SMTP_TEST_TO") or ""
             ).strip()
 
             subject = str(tool_args.get("subject") or "").strip()
@@ -851,6 +861,70 @@ def chad_execute_plan(id_str: str, date_str: str, base: str, plan: dict) -> dict
                 except Exception as e:
                     message = f"Chad failed to send_email due to error: {e!r}"
                     tool_result = ""
+
+        elif tool_name == "run_python_script":
+            # Run a Python script inside the project jail.
+            # Accept several possible arg names to be robust against Bob:
+            #   - path  (preferred, documented)
+            #   - script
+            #   - file
+            script_rel = str(
+                tool_args.get("path")
+                or tool_args.get("script")
+                or tool_args.get("file")
+                or ""
+            ).lstrip("/").strip()
+
+            # Extra CLI args may be in 'args' (preferred) or 'argv'.
+            extra_args = tool_args.get("args") or tool_args.get("argv") or []
+
+            if not script_rel:
+                message = (
+                    "Chad was asked to run_python_script but no script path was "
+                    "provided in tool args (expected 'path')."
+                )
+                tool_result = ""
+            else:
+                script_path = _resolve_in_project_jail(script_rel)
+
+                if (
+                    script_path is None
+                    or not script_path.exists()
+                    or not script_path.is_file()
+                ):
+                    message = (
+                        f"Chad tried to run_python_script on {script_rel!r} but the "
+                        "file does not exist, is not a file, or is outside the "
+                        "project jail."
+                    )
+                    tool_result = ""
+                else:
+                    try:
+                        proc = subprocess.run(
+                            [sys.executable, str(script_path), *map(str, extra_args)],
+                            cwd=str(PROJECT_ROOT),
+                            capture_output=True,
+                            text=True,
+                            timeout=600,
+                        )
+                        stdout = proc.stdout or ""
+                        stderr = proc.stderr or ""
+                        rc = proc.returncode
+
+                        tool_result = (
+                            f"Script: {script_rel}\n"
+                            f"Return code: {rc}\n\n"
+                            "STDOUT:\n"
+                            f"{stdout or '(empty)'}\n\n"
+                            "STDERR:\n"
+                            f"{stderr or '(empty)'}"
+                        )
+                        message = f"Chad ran 'run_python_script' on {script_rel!r}."
+                    except Exception as e:
+                        message = (
+                            f"Chad failed to run_python_script due to error: {e!r}"
+                        )
+                        tool_result = ""
 
         else:
             message = (
@@ -1108,16 +1182,16 @@ def chad_execute_plan(id_str: str, date_str: str, base: str, plan: dict) -> dict
             if target_path.suffix.lower() == ".py":
                 content_stripped = content.lstrip()
                 if content_stripped.startswith('"""') or content_stripped.startswith(
-                        "'''"
+                    "'''"
                 ):
                     lines = original.splitlines()
                     if lines and lines[0].startswith("#!"):
                         new_text_raw = (
-                                lines[0]
-                                + "\n\n"
-                                + content
-                                + "\n\n"
-                                + "\n".join(lines[1:])
+                            lines[0]
+                            + "\n\n"
+                            + content
+                            + "\n\n"
+                            + "\n".join(lines[1:])
                         )
                     else:
                         new_text_raw = content + "\n\n" + original
@@ -1274,7 +1348,7 @@ def api_chat():
     prefix = "#bob no-tools"
     if message.lower().startswith(prefix):
         tools_enabled = False
-        message = message[len(prefix):].lstrip()
+        message = message[len(prefix) :].lstrip()
 
     if not message:
         return jsonify(
@@ -1511,8 +1585,8 @@ def api_chat():
                 serious_keywords = (
                     "escapes project jail",
                     "does not exist",
+                    "not-utf-8",
                     "not utf-8",
-                    "not UTF-8",
                     "unknown operation",
                 )
                 serious_reasons: list[str] = []
@@ -1533,7 +1607,7 @@ def api_chat():
             extra={
                 "id": id_str,
                 "base": base,
-                "user_text": message,          # 👈 what repair_then_retry needs
+                "user_text": message,  # what repair_then_retry needs
                 "tools_enabled": tools_enabled,
                 "touched_files": touched_files,
                 "task_type": task_type,

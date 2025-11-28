@@ -1,3 +1,4 @@
+# chad/notes.py
 from __future__ import annotations
 
 from datetime import datetime
@@ -53,4 +54,42 @@ if hasattr(globals(), 'add_note') and callable(globals()['add_note']):
     def add_note_safe(note, filepath):
         safe_write_note(note, filepath)
     globals()['add_note'] = add_note_safe
+
+
+from chad.text_io import safe_read_file
+
+def load_note_content(note_path: str) -> str:
+    try:
+        content = safe_read_file(note_path)
+    except FileNotFoundError as e:
+        # Log or handle missing note file gracefully
+        raise FileNotFoundError(f"Note file missing: {note_path}") from e
+    return content
+
+
+# Improve notes management related to paths to be safer
+# Add new utility to sanitize and validate paths within notes
+import os
+
+def safe_get_abs_path(base_dir, target_path):
+    """Return an absolute path to target_path ensuring it stays within base_dir jail."""
+    abs_path = os.path.abspath(os.path.join(base_dir, target_path))
+    if not abs_path.startswith(os.path.abspath(base_dir)):
+        raise ValueError(f"Path escape detected: {abs_path} is outside base directory {base_dir}")
+    return abs_path
+
+# This utility can be used when notes implement or read/write paths, reinforcing jail safety
+
+
+# Defensive patch: Warn or fix when an attempt is made to schedule 'create_or_overwrite_file'
+
+def safe_schedule_tool(tool_name, *args, **kwargs):
+    if tool_name == 'create_or_overwrite_file':
+        # Log warning (print in dev) or raise a friendly error
+        print("Warning: 'create_or_overwrite_file' is not a valid tool. Using 'create_markdown_note' instead.")
+        tool_name = 'create_markdown_note'
+    # Original scheduling call here
+    return original_schedule_tool(tool_name, *args, **kwargs)
+
+# This requires original_schedule_tool to be defined or imported.
 

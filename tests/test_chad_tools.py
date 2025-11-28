@@ -1,3 +1,4 @@
+# tests/test_chad_tools.py
 #!/usr/bin/env python3
 """
 Basic tests for Chad's tool execution layer.

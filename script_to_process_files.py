@@ -1,3 +1,4 @@
+# script_to_process_files.py
 import os
 
 # Comment marker for each file type could be enhanced; now all files receive a python style comment.

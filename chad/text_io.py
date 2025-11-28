@@ -1,3 +1,4 @@
+# chad/text_io.py
 from __future__ import annotations
 
 from pathlib import Path
@@ -108,4 +109,20 @@ def safe_read_text(file_path):
         return f.read()
 
 # Possible patch: replace original read_text calls with safe_read_text in Chad where applicable
+
+
+import os
+
+def safe_read_file(filepath: str) -> str:
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"File not found when attempting to read: {filepath}")
+    with open(filepath, 'r', encoding='utf-8') as f:
+        return f.read()
+
+def safe_write_file(filepath: str, content: str):
+    dir_path = os.path.dirname(filepath)
+    if dir_path and not os.path.exists(dir_path):
+        os.makedirs(dir_path)
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(content)
 

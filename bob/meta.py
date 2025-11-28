@@ -1,3 +1,4 @@
+# bob/meta.py
 from __future__ import annotations
 
 """
@@ -1041,4 +1042,15 @@ logger = logging.getLogger('bob')
 def log_warning(message):
     """Log a warning message to assist debugging recurring file not found errors."""
     logger.warning(message)
+
+
+# Add meta metadata about enhanced path safety improvements
+# Mark this as a low priority mitigation attempt for recurring 'target path escapes project jail' failure
+
+path_safety_enhancements = {
+    'description': 'Additional path validation and absolute path jail enforcement added in planner and notes modules',
+    'priority': 'low',
+    'goal': 'Prevent target path escapes from project jail without weakening fs_tools core safety',
+    'status': 'implemented'
+}
 
