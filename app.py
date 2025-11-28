@@ -35,6 +35,10 @@ from openai import OpenAI
 
 from bob.meta_log import log_history_record
 
+import subprocess
+import sys
+import threading
+
 # ---------------------------------------------------------------------------
 # Env + OpenAI client
 # ---------------------------------------------------------------------------
@@ -68,6 +72,28 @@ if ENV_PROJECT_JAIL:
     PROJECT_ROOT = Path(ENV_PROJECT_JAIL).resolve()
 else:
     PROJECT_ROOT = AI_ROOT.resolve()
+
+
+def _auto_repair_then_retry_async() -> None:
+    """
+    Fire-and-forget: run `python3 -m bob.meta repair_then_retry` in the
+    background so Bob/Chad can self-repair and retry the last failed job.
+
+    This is deliberately best-effort: any errors are printed but never
+    break the HTTP request.
+    """
+    def _run() -> None:
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "bob.meta", "repair_then_retry"],
+                cwd=str(AI_ROOT),
+                check=False,
+            )
+        except Exception as e:
+            print(f"[Bob/Chad] auto repair_then_retry crashed: {e!r}")
+
+    threading.Thread(target=_run, daemon=True).start()
+
 
 # ---------------------------------------------------------------------------
 # Bob plan schema (for reference)
@@ -1496,6 +1522,11 @@ def api_chat():
                 "tool_name": (task.get("tool") or {}).get("name"),
             },
         )
+
+        # If this job clearly failed, kick off an automatic self-repair + retry
+        if result_label != "success":
+            _auto_repair_then_retry_async()
+
     except Exception:
         # Never let logging break the chat flow
         pass
