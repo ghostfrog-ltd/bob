@@ -1243,6 +1243,7 @@ def api_chat():
 
     plan = bob_build_plan(id_str, date_str, base, message, tools_enabled=tools_enabled)
 
+    # If Bob planned a codemod, refine with real file contents
     task = plan.get("task") or {}
     if task.get("type") == "codemod":
         original_edits = task.get("edits") or []
@@ -1274,9 +1275,11 @@ def api_chat():
                 file_contexts=file_contexts,
             )
             plan["task"] = refined_task
+            task = refined_task  # keep in sync
 
     exec_report = chad_execute_plan(id_str, date_str, base, plan)
 
+    # Common task info
     task = plan.get("task") or {}
     task_type = task.get("type", "analysis")
     summary = task.get("summary", message)
@@ -1289,7 +1292,9 @@ def api_chat():
         {"role": "bob", "text": f"Bob: Plan → {summary}"},
     ]
 
-    # Tool
+    # --------------------------------------------------
+    # TOOL
+    # --------------------------------------------------
     if tool_obj and task_type == "tool":
         tool_name = tool_obj.get("name") or exec_report.get("tool_name") or ""
         tool_result = exec_report.get("tool_result", "")
@@ -1324,7 +1329,9 @@ def api_chat():
             }
         )
 
-    # Pure chat (no tool, no edits, no analysis file)
+    # --------------------------------------------------
+    # PURE CHAT (no tool, no edits, no analysis file)
+    # --------------------------------------------------
     elif not analysis_file and not edits and not tool_obj:
         answer = bob_simple_chat(message)
         ui_messages.append({"role": "bob", "text": answer})
@@ -1342,7 +1349,9 @@ def api_chat():
             }
         )
 
-    # Analysis
+    # --------------------------------------------------
+    # ANALYSIS
+    # --------------------------------------------------
     elif task_type == "analysis":
         ui_messages.append(
             {
@@ -1367,7 +1376,9 @@ def api_chat():
             }
         )
 
-    # Codemod
+    # --------------------------------------------------
+    # CODEMOD
+    # --------------------------------------------------
     else:
         touched_files = exec_report.get("touched_files") or []
         ui_messages.append({"role": "chad", "text": "Chad: working on Bob's plan…"})
@@ -1414,79 +1425,80 @@ def api_chat():
             }
         )
 
-        # --------------------------------------------------------------
-        # Log this run into meta/history.jsonl for Bob's self-analysis
-        # --------------------------------------------------------------
-        try:
-            result_label = "success"
-            tests_label = "not_run"  # we only run tests at startup currently
-            error_summary = None
+    # --------------------------------------------------------------
+    # Unified history logging for ALL job types
+    # --------------------------------------------------------------
+    try:
+        result_label = "success"
+        tests_label = "not_run"
+        error_summary = None
 
-            msg_text = (exec_report.get("message") or "").lower()
-            task_type = task.get("type", "analysis")
-            touched_files = exec_report.get("touched_files") or []
-            edit_logs = exec_report.get("edit_logs") or []
-            edits_requested = exec_report.get("edits_requested", len(edits))
+        msg_text = (exec_report.get("message") or "").lower()
+        edits_requested = exec_report.get("edits_requested", len(edits))
+        touched_files = exec_report.get("touched_files") or []
+        edit_logs = exec_report.get("edit_logs") or []
 
-            # Base heuristic: obvious fail words in the message
-            if "failed" in msg_text or "error" in msg_text:
+        # Base heuristic for failure
+        if (
+            "failed" in msg_text
+            or "error" in msg_text
+            or "unknown tool" in msg_text
+        ):
+            result_label = "fail"
+            error_summary = exec_report.get("message")
+
+        # Codemod-specific heuristics
+        if task_type == "codemod":
+            if edits_requested and not touched_files:
                 result_label = "fail"
-                error_summary = exec_report.get("message")
-
-            # Codemod-specific heuristics
-            if task_type == "codemod":
-                # If Bob asked for edits but Chad applied none → treat as failure
-                if edits_requested and not touched_files:
+                reasons: list[str] = []
+                for e in edit_logs:
+                    r = (e.get("reason") or "").strip()
+                    if r and r not in reasons:
+                        reasons.append(r)
+                    if len(reasons) >= 3:
+                        break
+                error_summary = (
+                    "; ".join(reasons)
+                    if reasons
+                    else "codemod edits requested but no files were modified"
+                )
+            else:
+                serious_keywords = (
+                    "escapes project jail",
+                    "does not exist",
+                    "not utf-8",
+                    "not UTF-8",
+                    "unknown operation",
+                )
+                serious_reasons: list[str] = []
+                for e in edit_logs:
+                    r = (e.get("reason") or "").lower()
+                    if any(k in r for k in serious_keywords):
+                        serious_reasons.append(e.get("reason") or r)
+                if serious_reasons:
                     result_label = "fail"
-                    # Summarise up to a few distinct reasons from edit_logs
-                    reasons: list[str] = []
-                    for e in edit_logs:
-                        r = (e.get("reason") or "").strip()
-                        if r and r not in reasons:
-                            reasons.append(r)
-                        if len(reasons) >= 3:
-                            break
-                    error_summary = (
-                        "; ".join(reasons)
-                        if reasons
-                        else "codemod edits requested but no files were modified"
-                    )
-                else:
-                    # Even if some files were touched, scan edit_logs for serious issues
-                    serious_keywords = (
-                        "escapes project jail",
-                        "does not exist",
-                        "not utf-8",
-                        "not UTF-8",
-                        "unknown operation",
-                    )
-                    serious_reasons: list[str] = []
-                    for e in edit_logs:
-                        r = (e.get("reason") or "").lower()
-                        if any(k in r for k in serious_keywords):
-                            serious_reasons.append(e.get("reason") or r)
-                    if serious_reasons:
-                        result_label = "fail"
-                        error_summary = "; ".join(serious_reasons[:3])
+                    error_summary = "; ".join(serious_reasons[:3])
 
-            log_history_record(
-                target="ghostfrog",
-                result=result_label,
-                tests=tests_label,
-                error_summary=error_summary,
-                human_fix_required=False,
-                extra={
-                    "id": id_str,
-                    "base": base,
-                    "task_type": task_type,
-                    "tool_name": (task.get("tool") or {}).get("name"),
-                    "touched_files": exec_report.get("touched_files"),
-                },
-            )
-        except Exception:
-            # Never let logging break the chat flow
-            pass
-
+        log_history_record(
+            target="ghostfrog",
+            result=result_label,
+            tests=tests_label,
+            error_summary=error_summary,
+            human_fix_required=result_label != "success",
+            extra={
+                "id": id_str,
+                "base": base,
+                "user_text": message,          # 👈 what repair_then_retry needs
+                "tools_enabled": tools_enabled,
+                "touched_files": touched_files,
+                "task_type": task_type,
+                "tool_name": (task.get("tool") or {}).get("name"),
+            },
+        )
+    except Exception:
+        # Never let logging break the chat flow
+        pass
 
     return jsonify({"messages": ui_messages})
 

@@ -121,6 +121,7 @@ def run_ticket_with_tests(ticket: Ticket, max_attempts: int = 2) -> Dict[str, An
         "last_error": last_error,
     }
 
+
 def _snapshot_files(rel_paths: List[str]) -> Dict[str, Optional[str]]:
     """
     Take an in-memory snapshot of the files Bob is allowed to touch.
@@ -150,6 +151,7 @@ def _restore_files(snapshot: Dict[str, Optional[str]]) -> None:
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(content, encoding="utf-8")
 
+
 # ---------------------------------------------------------------------
 # Paths / constants
 # ---------------------------------------------------------------------
@@ -157,7 +159,7 @@ def _restore_files(snapshot: Dict[str, Optional[str]]) -> None:
 ROOT_DIR = Path(__file__).resolve().parents[1]  # .../ghostfrog-project-bob
 DATA_DIR = ROOT_DIR / "data"
 META_DIR = DATA_DIR / "meta"
-HISTORY_FILE = META_DIR / "history.jsonl"      # append-only JSONL
+HISTORY_FILE = META_DIR / "history.jsonl"  # append-only JSONL
 TICKETS_DIR = META_DIR / "tickets"
 QUEUE_DIR = DATA_DIR / "queue"
 
@@ -194,11 +196,11 @@ class HistoryRecord:
 @dataclass
 class Issue:
     """An aggregated failure pattern across many HistoryRecords."""
-    key: str                       # stable key for grouping (e.g. error slug)
-    area: str                      # planner / executor / fs_tools / tests / other
-    description: str               # human-readable description
-    evidence_ids: List[int]        # line numbers or indices in history
-    examples: List[str]            # short error snippets
+    key: str  # stable key for grouping (e.g. error slug)
+    area: str  # planner / executor / fs_tools / tests / other
+    description: str  # human-readable description
+    evidence_ids: List[int]  # line numbers or indices in history
+    examples: List[str]  # short error snippets
 
 
 @dataclass
@@ -210,14 +212,14 @@ class Ticket:
     into Bob's planner as the "user message" if you like.
     """
     id: str
-    scope: str               # "self" or "ghostfrog" / etc.
-    area: str                # planner / executor / fs_tools / tests / other
+    scope: str  # "self" or "ghostfrog" / etc.
+    area: str  # planner / executor / fs_tools / tests / other
     title: str
     description: str
     evidence: List[str]
-    priority: str            # low / medium / high
+    priority: str  # low / medium / high
     created_at: str
-    safe_paths: List[str]    # paths allowed for auto-editing
+    safe_paths: List[str]  # paths allowed for auto-editing
     raw_issue_key: str
 
 
@@ -249,21 +251,21 @@ def _parse_history_line(line: str) -> Optional[HistoryRecord]:
         error_summary=data.get("error_summary") or data.get("error") or data.get("traceback"),
         human_fix_required=data.get("human_fix_required"),
         extra={
-            k: v
-            for k, v in data.items()
-            if k
-            not in {
-                "ts",
-                "target",
-                "result",
-                "tests",
-                "error_summary",
-                "error",
-                "traceback",
-                "human_fix_required",
-            }
-        }
-        or None,
+                  k: v
+                  for k, v in data.items()
+                  if k
+                     not in {
+                         "ts",
+                         "target",
+                         "result",
+                         "tests",
+                         "error_summary",
+                         "error",
+                         "traceback",
+                         "human_fix_required",
+                     }
+              }
+              or None,
     )
 
 
@@ -356,9 +358,9 @@ def _make_ticket_id(issue: Issue) -> str:
 
 
 def issues_to_tickets(
-    issues: Iterable[Issue],
-    scope: str = META_TARGET_SELF,
-    limit: int = 5,
+        issues: Iterable[Issue],
+        scope: str = META_TARGET_SELF,
+        limit: int = 5,
 ) -> List[Ticket]:
     tickets: List[Ticket] = []
     for issue in issues:
@@ -481,6 +483,50 @@ def enqueue_self_improvement(ticket: Ticket) -> Path:
         json.dump(queue_item, f, indent=2, ensure_ascii=False)
     return path
 
+def _extract_user_text(extra: Optional[Dict[str, Any]]) -> Optional[str]:
+    """
+    Try hard to pull a user_text-like field out of a history.extra blob.
+
+    Handles:
+      - flattened keys:   {"user_text": "..."}
+      - nested extra key: {"extra": {"user_text": "..."}}
+      - fallbacks: raw_user_text / message / prompt
+      - legacy rows: use `base` and read data/queue/{base}.user.txt
+    """
+    if not extra:
+        return None
+
+    # 1) Common case: flattened field
+    val = extra.get("user_text")
+    if isinstance(val, str) and val.strip():
+        return val.strip()
+
+    # 2) Nested under "extra" (if meta_log kept it nested)
+    nested = extra.get("extra")
+    if isinstance(nested, dict):
+        val2 = nested.get("user_text")
+        if isinstance(val2, str) and val2.strip():
+            return val2.strip()
+
+    # 3) Fallback alternative field names
+    for key in ("raw_user_text", "message", "prompt"):
+        v = extra.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+    # 4) Legacy rows: recover from queue file using `base`
+    base = extra.get("base")
+    if isinstance(base, str) and base.strip():
+        fname = f"{base}.user.txt"
+        path = QUEUE_DIR / fname
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError:
+            raw = ""
+        if raw.strip():
+            return raw.strip()
+
+    return None
 
 # ---------------------------------------------------------------------
 # Running self-improvement tickets directly (Bob + Chad)
@@ -627,6 +673,126 @@ def cmd_analyse(args: argparse.Namespace) -> None:
         )
 
 
+def cmd_repair_then_retry(args: argparse.Namespace) -> None:
+    """
+    1. Find the last FAILED real job (target="ghostfrog") that has some
+       user_text-like payload.
+    2. Run a mini self-repair cycle (1 ticket, 1 retry).
+    3. Retry that same job automatically using stored metadata.
+    """
+
+    history = load_history(limit=500)
+
+    # First find *any* failed ghostfrog jobs at all (for nicer diagnostics)
+    failed_ghostfrog: List[HistoryRecord] = [
+        rec
+        for rec in history
+        if rec.target == META_TARGET_GF and rec.result != "success"
+    ]
+
+    if not failed_ghostfrog:
+        print("[repair_then_retry] No failed ghostfrog jobs found in history.")
+        return
+
+    # Now walk newest → oldest and find one with extractable user_text
+    failed_real: Optional[HistoryRecord] = None
+    user_text: Optional[str] = None
+
+    for rec in reversed(failed_ghostfrog):  # newest first
+        candidate_text = _extract_user_text(rec.extra)
+        if candidate_text:
+            failed_real = rec
+            user_text = candidate_text
+            break
+
+    if not failed_real or not user_text:
+        # Help you debug what's actually in extra
+        last = failed_ghostfrog[-1]
+        keys = sorted((last.extra or {}).keys())
+        print("[repair_then_retry] Failed ghostfrog jobs exist but none have usable user_text.")
+        print(f"  Last failed record ts={last.ts}, extra keys={keys}")
+        return
+
+    print(f"[repair_then_retry] Found failed job:")
+    print(f"  ts={failed_real.ts}")
+    print(f"  error={failed_real.error_summary}")
+    print()
+
+    tools_enabled = True
+    if failed_real.extra:
+        # tolerate both flattened and nested
+        te = failed_real.extra.get("tools_enabled")
+        if isinstance(te, bool):
+            tools_enabled = te
+        else:
+            nested = failed_real.extra.get("extra")
+            if isinstance(nested, dict) and isinstance(nested.get("tools_enabled"), bool):
+                tools_enabled = nested["tools_enabled"]
+
+    # 2) Run a mini self-cycle (1 ticket, 1 retry)
+    print("[repair_then_retry] Running self-repair first...")
+
+    mini_args = argparse.Namespace(
+        limit=200,
+        count=1,
+        retries=1,
+    )
+    cmd_self_cycle(mini_args)
+
+    print("\n[repair_then_retry] Self-repair complete. Retrying failed job...\n")
+
+    # 3) Retry original job automatically
+    from app import bob_build_plan, chad_execute_plan, next_message_id
+
+    id_str, date_str, base = next_message_id()
+
+    plan = bob_build_plan(
+        id_str=id_str,
+        date_str=date_str,
+        base=base,
+        user_text=user_text,
+        tools_enabled=tools_enabled,
+    )
+
+    exec_report = chad_execute_plan(
+        id_str=id_str,
+        date_str=date_str,
+        base=base,
+        plan=plan,
+    )
+
+    message = exec_report.get("message")
+    touched_files = exec_report.get("touched_files")
+    error_summary = None
+    result_label = "success"
+
+    if message and ("error" in message.lower() or "failed" in message.lower()):
+        result_label = "fail"
+        error_summary = message
+
+    log_history_record(
+        target=META_TARGET_GF,
+        result=result_label,
+        tests="not_run",
+        error_summary=error_summary,
+        human_fix_required=False,
+        extra={
+            "id": id_str,
+            "base": base,
+            "retry_of_ts": failed_real.ts,
+            "user_text": user_text,
+            "tools_enabled": tools_enabled,
+            "touched_files": touched_files,
+        },
+    )
+
+    print("[repair_then_retry] Retry completed:")
+    print(f"  result={result_label}")
+    if error_summary:
+        print(f"  error={error_summary[:300]}")
+
+
+
 def cmd_tickets(args: argparse.Namespace) -> None:
     history = load_history(limit=args.limit)
     issues = detect_issues(history)
@@ -709,7 +875,6 @@ def cmd_self_cycle(args: argparse.Namespace) -> None:
             print("    last pytest error (truncated):")
             if summary["last_error"]:
                 print("    ", summary["last_error"][:400].replace("\n", "\n    "))
-
 
 
 def cmd_teach_rule(args: argparse.Namespace) -> None:
@@ -815,6 +980,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pc.set_defaults(func=cmd_self_cycle)
 
+    # meta repair_then_retry
+    prr = sub.add_parser(
+        "repair_then_retry",
+        help="Run self-repair then automatically retry the last failed ghostfrog job.",
+    )
+    prr.set_defaults(func=cmd_repair_then_retry)
+
     # meta teach_rule (direct self-teaching via notes)
     pr = sub.add_parser(
         "teach_rule",
@@ -835,14 +1007,13 @@ def main(argv: Optional[List[str]] = None) -> None:
 if __name__ == "__main__":
     main()
 
-
 import logging
 
 logger = logging.getLogger('bob')
+
 
 # Add utility logging function for warnings
 
 def log_warning(message):
     """Log a warning message to assist debugging recurring file not found errors."""
     logger.warning(message)
-
