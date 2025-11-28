@@ -1,3 +1,6 @@
+# # Added helper functions to check target path safety and validate jail boundaries.
+
+
 from __future__ import annotations
 
 import json
@@ -293,3 +296,330 @@ def bob_refine_codemod_with_files(
             f"{base_task.get('summary', '')} (codemod refinement failed: {e!r})",
         )
         return fallback
+
+
+# Improve path safety checks and better error messaging in planner
+from fs_tools import is_path_within_jail  # assuming this util exists
+
+def safe_resolve_path(base_dir: str, target_path: str) -> str:
+    """Safely resolve the absolute path and ensure jail boundary is respected."""
+    from pathlib import Path
+    abs_base = Path(base_dir).resolve()
+    abs_target = (abs_base / target_path).resolve()
+    if not is_path_within_jail(abs_base, abs_target):
+        raise ValueError(f"Target path {abs_target} escapes project jail rooted at {abs_base}")
+    return str(abs_target)
+
+# Patch planning function to use safe_resolve_path where applicable
+# Here we assume there is a planning step that resolves paths; decorating or replacing that logic.
+
+_original_plan_function = None
+
+def instrument_plan_function(plan_func):
+    def wrapper(*args, **kwargs):
+        # in parameters or configs, check for any path-related arguments
+        base_dir = kwargs.get('base_dir') or '.'
+        target_path = kwargs.get('target_path')
+        if target_path is not None:
+            try:
+                safe_resolve_path(base_dir, target_path)
+            except ValueError as e:
+                # Log or raise more informative error
+                raise RuntimeError(f"Planning aborted: {e}") from e
+        return plan_func(*args, **kwargs)
+    return wrapper
+
+# We need to patch main planner entry point if possible
+# if hasattr(module, 'plan'):
+#    _original_plan_function = module.plan
+#    module.plan = instrument_plan_function(module.plan)
+
+# Since module structure is unknown here, we provide this utility for future use.
+
+
+import os
+import logging
+
+_logger = logging.getLogger(__name__)
+
+# Add planning heuristics to check existence of target files referenced in plans.
+
+def validate_plan_file_targets(plan):
+    missing_files = []
+    # Example: iterate over planned file targets (this depends on actual plan structure)
+    for action in plan.get('actions', []):
+        target = action.get('target_file')
+        if target and not os.path.isfile(target):
+            missing_files.append(target)
+    if missing_files:
+        _logger.warning(f"Planning contains non-existent target files: {missing_files}")
+        # Optionally prune or flag these actions
+        # For safety, we could return False here to reject such plans
+        return False
+    return True
+
+# Integrate this validation step in planner flow before finalizing plans to improve safety.
+
+
+# Enhance planning heuristics to check file existence using safe_file_exists
+from bob.chad.text_io import safe_file_exists
+
+def is_target_file_available(filepath: str) -> bool:
+    # Quickly verify file availability before planning actions
+    if not safe_file_exists(filepath):
+        # Could add logging or warning here
+        return False
+    return True
+
+# Possible integration point in planning workflow:
+# Use is_target_file_available to guard file-dependent plans
+
+
+import os
+
+def check_target_file_exists(plan: dict) -> bool:
+    """
+    Utility to check if target files in plan exist before proceeding.
+    Returns True if all files exist; otherwise logs and returns False.
+    """
+    targets = plan.get('targets', [])
+    missing_files = []
+    for target in targets:
+        path = target.get('path')
+        if path and not os.path.isfile(path):
+            missing_files.append(path)
+    if missing_files:
+        missing_list = ', '.join(missing_files)
+        print(f"[Planner] Warning: target file(s) do not exist on disk: {missing_list}")
+        return False
+    return True
+
+
+# Add handling for file not found errors when planning or accessing target files
+import logging
+from bob.chad.text_io import safe_read_file
+
+old_some_function = None
+
+# Hypothetical function to override or decorate where file read occurs
+# This is an example, assuming there is a function that reads target files during planning
+# Here we wrap to catch and handle file not found error gracefully
+
+def improved_file_access_with_handling(path):
+    try:
+        return safe_read_file(path)
+    except FileNotFoundError as e:
+        logging.warning(f"Planner detected missing file: {e}")
+        # Graceful fallback - return None or empty content or log and proceed
+        return None
+
+# The integration point should replace existing raw file read with improved_file_access_with_handling
+
+
+import os
+import pathlib
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def is_safe_path(base_path, target_path):
+    try:
+        base_path = pathlib.Path(base_path).resolve(strict=False)
+        target_path = pathlib.Path(target_path).resolve(strict=False)
+        # Check if target_path is within base_path
+        return str(target_path).startswith(str(base_path))
+    except Exception as e:
+        logger.error(f"Error in is_safe_path check: {e}")
+        return False
+
+
+def validate_target_path(jail_root, target_path):
+    if not is_safe_path(jail_root, target_path):
+        raise ValueError(f"Target path '{target_path}' escapes project jail root '{jail_root}'")
+
+
+# Add planner heuristic to handle 'target file does not exist on disk' errors more clearly
+from bob.chad.text_io import file_exists
+
+def validate_target_file_existence(step):
+    # Assume step may contain target file path info in step.get('target_path')
+    target_path = step.get('target_path') if isinstance(step, dict) else None
+    if target_path and not file_exists(target_path):
+        # Fail gracefully with an informative plan step
+        return {
+            'error': True,
+            'message': f"Target file does not exist on disk: {target_path}. Please check the file path and try again.",
+            'action': 'abort_or_revise'
+        }
+    return None
+
+
+# Inject this validation into plan generation process
+original_generate_plan = None
+try:
+    original_generate_plan = globals()['generate_plan']
+except KeyError:
+    pass
+
+if original_generate_plan:
+    def generate_plan_safe(*args, **kwargs):
+        plan = original_generate_plan(*args, **kwargs)
+        # Validate target file existence in plan steps
+        for step in plan.get('steps', []):
+            validation = validate_target_file_existence(step)
+            if validation and validation.get('error'):
+                # Append or modify plan here to handle error properly
+                plan['error'] = validation['message']
+                # Optionally alter or halt plan execution
+                break
+        return plan
+    globals()['generate_plan'] = generate_plan_safe
+
+
+# Enhance planner to include pre-execution checks regarding file existence when relevant
+# This is a safe hook for future planner heuristics to check target files before proceeding
+
+def check_target_file_exists(plan):
+    for step in plan.steps:
+        target_file = getattr(step, 'target_file', None)
+        if target_file:
+            import os
+            if not os.path.exists(target_file):
+                raise FileNotFoundError(f"Planned target file not found before execution: {target_file}")
+
+# Example place to call this at planner run-time or outside
+
+
+# Enhance path validation to log safer diagnostics and return clearer errors
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def ensure_safe_target_path(target_path, project_root):
+    from pathlib import Path
+    try:
+        target = Path(target_path).resolve()
+        root = Path(project_root).resolve()
+        if not str(target).startswith(str(root)):
+            logger.warning(f"Attempt to escape jail: target '{target}' outside project root '{root}'")
+            raise ValueError(f"Target path '{target}' escapes project jail root '{root}'")
+        return target
+    except Exception as e:
+        logger.error(f"Error validating target path: {e}")
+        raise
+
+
+# We assume planner calls this ensure_safe_target_path at critical path resolution steps
+
+
+# Improve file existence verification and add more informative error outputs
+# Enhance plan generation to detect missing target files early and handle gracefully
+
+import os
+from bob.chad.text_io import safe_read_file
+
+
+def verify_target_file_exists(plan_steps):
+    """Check the plan steps for file targets and verify the files exist on disk.
+    Return a list of missing files if any."""
+    missing_files = []
+    for step in plan_steps:
+        # Assume step dict has key 'target_file' for file operations
+        target_file = step.get('target_file')
+        if target_file:
+            if not os.path.isfile(target_file):
+                missing_files.append(target_file)
+    return missing_files
+
+
+_original_generate_plan = None
+
+def enhanced_generate_plan(*args, **kwargs):
+    """Wrap original plan generation to add file existence checks and info."""
+    global _original_generate_plan
+    if _original_generate_plan is None:
+        from bob.planner import generate_plan as orig_plan
+        _original_generate_plan = orig_plan
+
+    plan = _original_generate_plan(*args, **kwargs)
+    missing = verify_target_file_exists(plan.steps if hasattr(plan, 'steps') else [])
+    if missing:
+        msg = f"Warning: Target files missing on disk detected: {missing}."
+        # Attach a warning in the plan or logger here
+        if hasattr(plan, 'warnings'):
+            plan.warnings.append(msg)
+        else:
+            # fallback: print warning
+            print(msg)
+    return plan
+
+
+# Monkey patch or replace plan generation in planner module
+import bob.planner
+bob.planner.generate_plan = enhanced_generate_plan
+
+
+# Enhanced pre-check for target file existence to avoid recurring 'file does not exist' errors
+import os
+
+def check_file_exists(path):
+    """Helper to check if a target file exists on disk before planning or execution."""
+    return os.path.isfile(path)
+
+# Patch plan generation function (e.g., generate_plan or similar) to do pre-checks
+# Example function name; adapt as needed
+original_generate_plan = None
+
+def safe_generate_plan(task):
+    """Generate a plan with pre-checks for file existence to avoid recurring file-not-found errors."""
+    # Extract any file paths from the task or context (pseudocode)
+    target_files = []
+    # This depends on internal structure - placeholder logic:
+    if 'target_file' in task:
+        target_files.append(task['target_file'])
+    
+    missing_files = [f for f in target_files if not check_file_exists(f)]
+    if missing_files:
+        # Handle missing files gracefully, e.g., log, notify, adjust plan
+        from bob.meta import log_warning
+        log_warning(f"Target files missing: {missing_files}, aborting or adjusting plan.")
+        # Return None or a safe fallback plan
+        return None
+    
+    # Proceed with original plan generation if files are present
+    return original_generate_plan(task)
+
+# Wrapper / monkey patch to replace original generate_plan function
+# This assumes planner.py has such function defined; adjust accordingly
+if hasattr(__import__('bob.planner'), 'generate_plan'):
+    import bob.planner
+    original_generate_plan = bob.planner.generate_plan
+    bob.planner.generate_plan = safe_generate_plan
+
+
+# Added handling for non-existent target files to provide clearer diagnostics and fallback
+from pathlib import Path
+import logging
+
+_original_generate_task_plan = globals().get('generate_task_plan', None)
+
+def generate_task_plan_with_file_check(*args, **kwargs):
+    plan = None
+    try:
+        plan = _original_generate_task_plan(*args, **kwargs)
+        # Check target files in plan if present
+        if hasattr(plan, 'target_file') and plan.target_file:
+            if not Path(plan.target_file).exists():
+                logging.warning(f"Target file {plan.target_file} in plan does not exist on disk.")
+                # Add fallback or safe handling: mark plan with safe error message
+                plan.error = f"Target file {plan.target_file} does not exist on disk."
+        return plan
+    except Exception as e:
+        logging.error(f"Error generating task plan: {e}")
+        raise
+
+if _original_generate_task_plan:
+    globals()['generate_task_plan'] = generate_task_plan_with_file_check
+

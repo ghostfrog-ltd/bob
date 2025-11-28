@@ -58,3 +58,8 @@ BOB_PLAN_SCHEMA = {
     "required": ["task_type", "summary", "analysis_file", "edits"],
     "additionalProperties": False,
 }
+
+
+# No changes needed here as schema relates to data models, not path safety.
+# However, a note or validator could be added in the future if needed.
+

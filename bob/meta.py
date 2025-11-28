@@ -1,0 +1,702 @@
+from __future__ import annotations
+
+"""
+bob/meta.py
+
+Meta-layer for Bob ⇄ Chad.
+
+Responsibilities
+----------------
+- Read recent task history (success/fail, errors, etc.)
+- Detect recurring failure patterns.
+- Emit "tickets" describing self-improvement work Bob/Chad
+  should perform on *this* project.
+- Optionally enqueue self-improvement jobs into data/queue/
+  so the normal Bob → Chad pipeline can handle them.
+- NEW:
+  * `self_cycle` subcommand which generates tickets AND
+    immediately runs them via Bob/Chad (no copy/paste needed).
+  * `teach_rule` subcommand which asks Bob to store a new
+    internal planning rule in his markdown notes.
+"""
+
+import argparse
+import json
+import textwrap
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable, List, Dict, Any, Tuple, Optional
+
+from .meta_log import log_history_record  # local helper for history logging
+
+# ---------------------------------------------------------------------
+# Paths / constants
+# ---------------------------------------------------------------------
+
+ROOT_DIR = Path(__file__).resolve().parents[1]  # .../ghostfrog-project-bob
+DATA_DIR = ROOT_DIR / "data"
+META_DIR = DATA_DIR / "meta"
+HISTORY_FILE = META_DIR / "history.jsonl"      # append-only JSONL
+TICKETS_DIR = META_DIR / "tickets"
+QUEUE_DIR = DATA_DIR / "queue"
+
+# Files we're willing to let the system touch in "self" mode.
+SAFE_SELF_PATHS: Tuple[str, ...] = (
+    "bob/config.py",
+    "bob/planner.py",
+    "bob/schema.py",
+    "chad/notes.py",
+    "chad/text_io.py",
+    "bob/meta.py"
+)
+
+META_TARGET_SELF = "self"
+META_TARGET_GF = "ghostfrog"  # label for your main project runs
+
+
+# ---------------------------------------------------------------------
+# Data models
+# ---------------------------------------------------------------------
+
+@dataclass
+class HistoryRecord:
+    """Single run of Bob/Chad on some task (real project or self)."""
+    ts: str
+    target: str
+    result: str
+    tests: str | None = None
+    error_summary: str | None = None
+    human_fix_required: bool | None = None
+    extra: Dict[str, Any] | None = None
+
+
+@dataclass
+class Issue:
+    """An aggregated failure pattern across many HistoryRecords."""
+    key: str                       # stable key for grouping (e.g. error slug)
+    area: str                      # planner / executor / fs_tools / tests / other
+    description: str               # human-readable description
+    evidence_ids: List[int]        # line numbers or indices in history
+    examples: List[str]            # short error snippets
+
+
+@dataclass
+class Ticket:
+    """
+    Concrete self-improvement ticket that Bob/Chad can act on.
+
+    This is intentionally generic: you can feed the 'prompt' field
+    into Bob's planner as the "user message" if you like.
+    """
+    id: str
+    scope: str               # "self" or "ghostfrog" / etc.
+    area: str                # planner / executor / fs_tools / tests / other
+    title: str
+    description: str
+    evidence: List[str]
+    priority: str            # low / medium / high
+    created_at: str
+    safe_paths: List[str]    # paths allowed for auto-editing
+    raw_issue_key: str
+
+
+# ---------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------
+
+def _ensure_dirs() -> None:
+    META_DIR.mkdir(parents=True, exist_ok=True)
+    TICKETS_DIR.mkdir(parents=True, exist_ok=True)
+    QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _parse_history_line(line: str) -> Optional[HistoryRecord]:
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        data = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+
+    # Very forgiving: we fill what we can.
+    return HistoryRecord(
+        ts=data.get("ts") or datetime.now(timezone.utc).isoformat(),
+        target=data.get("target") or "unknown",
+        result=data.get("result") or "unknown",
+        tests=data.get("tests"),
+        error_summary=data.get("error_summary") or data.get("error") or data.get("traceback"),
+        human_fix_required=data.get("human_fix_required"),
+        extra={
+            k: v
+            for k, v in data.items()
+            if k
+            not in {
+                "ts",
+                "target",
+                "result",
+                "tests",
+                "error_summary",
+                "error",
+                "traceback",
+                "human_fix_required",
+            }
+        }
+        or None,
+    )
+
+
+def load_history(limit: int = 200) -> List[HistoryRecord]:
+    """
+    Load the last `limit` records from history.jsonl.
+    If the file doesn't exist, return [].
+    """
+    if not HISTORY_FILE.exists():
+        return []
+
+    lines = HISTORY_FILE.read_text(encoding="utf-8").splitlines()
+    selected = lines[-limit:]
+
+    records: List[HistoryRecord] = []
+    for _, line in enumerate(selected):
+        rec = _parse_history_line(line)
+        if rec:
+            records.append(rec)
+    return records
+
+
+def _short_error_slug(error: str | None, max_len: int = 80) -> str:
+    if not error:
+        return "NO_ERROR"
+    error = error.strip().replace("\n", " ")
+    if len(error) <= max_len:
+        return error
+    return error[: max_len - 3] + "..."
+
+
+def _guess_area(rec: HistoryRecord) -> str:
+    """
+    Very rough heuristic for which subsystem is at fault.
+    You can refine this over time.
+    """
+    err = (rec.error_summary or "").lower()
+    if "fs_tools" in err or "path" in err or "jail" in err:
+        return "fs_tools"
+    if "planner" in err or "plan" in err:
+        return "planner"
+    if "pytest" in err or "test" in err or "assert" in err:
+        return "tests"
+    if "executor" in err:
+        return "executor"
+    return "other"
+
+
+def detect_issues(history: Iterable[HistoryRecord]) -> List[Issue]:
+    """
+    Group failures by error slug and produce Issue objects.
+    """
+    grouped: Dict[str, Issue] = {}
+
+    for idx, rec in enumerate(history):
+        if rec.result.lower() == "success":
+            continue  # we're only interested in failures / partials
+
+        slug = _short_error_slug(rec.error_summary)
+        if slug not in grouped:
+            grouped[slug] = Issue(
+                key=slug,
+                area=_guess_area(rec),
+                description=f"Recurring failure: {slug}",
+                evidence_ids=[],
+                examples=[],
+            )
+        issue = grouped[slug]
+        issue.evidence_ids.append(idx)
+        if rec.error_summary and len(issue.examples) < 3:
+            issue.examples.append(rec.error_summary)
+
+    # Sort by number of occurrences desc
+    issues = sorted(grouped.values(), key=lambda i: len(i.evidence_ids), reverse=True)
+    return issues
+
+
+def _priority_from_issue(issue: Issue) -> str:
+    count = len(issue.evidence_ids)
+    if count >= 10:
+        return "high"
+    if count >= 4:
+        return "medium"
+    return "low"
+
+
+def _make_ticket_id(issue: Issue) -> str:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return f"T-{ts}-{abs(hash(issue.key)) % 100000:05d}"
+
+
+def issues_to_tickets(
+    issues: Iterable[Issue],
+    scope: str = META_TARGET_SELF,
+    limit: int = 5,
+) -> List[Ticket]:
+    tickets: List[Ticket] = []
+    for issue in issues:
+        if len(tickets) >= limit:
+            break
+
+        title = issue.description
+        priority = _priority_from_issue(issue)
+        created_at = datetime.now(timezone.utc).isoformat()
+
+        evidence_lines: List[str] = []
+        for idx, example in zip(issue.evidence_ids, issue.examples):
+            evidence_lines.append(f"record #{idx}: {example}")
+
+        description = textwrap.dedent(
+            f"""
+            Area: {issue.area}
+            Scope: {scope}
+
+            Problem:
+              {issue.description}
+
+            Evidence:
+            {chr(10).join('- ' + e for e in evidence_lines) if evidence_lines else '  (no examples recorded)'}
+
+            Desired outcome:
+              Make Bob/Chad more robust in this area so that this recurring
+              error either disappears or is gracefully handled (clearer plans,
+              safer execution, better tests, etc.).
+            """
+        ).strip()
+
+        ticket = Ticket(
+            id=_make_ticket_id(issue),
+            scope=scope,
+            area=issue.area,
+            title=title,
+            description=description,
+            evidence=evidence_lines,
+            priority=priority,
+            created_at=created_at,
+            safe_paths=list(SAFE_SELF_PATHS),
+            raw_issue_key=issue.key,
+        )
+        tickets.append(ticket)
+
+    return tickets
+
+
+def save_ticket(ticket: Ticket) -> Path:
+    """Write a ticket JSON to TICKETS_DIR and return its path."""
+    _ensure_dirs()
+    path = TICKETS_DIR / f"{ticket.id}.json"
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(asdict(ticket), f, indent=2, ensure_ascii=False)
+    return path
+
+
+def build_self_improvement_prompt(ticket: Ticket) -> str:
+    """
+    Build the natural-language prompt that tells Bob how to
+    self-improve for this ticket.
+    """
+    return textwrap.dedent(
+        f"""
+        You are Bob running in SELF-IMPROVEMENT mode.
+
+        There is a recurring failure pattern:
+
+        Title: {ticket.title}
+        Area: {ticket.area}
+        Priority: {ticket.priority}
+
+        Description:
+        {ticket.description}
+
+        You are allowed to modify ONLY the following files:
+        {chr(10).join('- ' + p for p in ticket.safe_paths)}
+
+        Goal:
+          Propose and implement minimal, safe changes to this repository
+          that reduce or eliminate this recurring error, while keeping all
+          tests passing.
+
+        Constraints:
+        - Do not relax or remove safety checks in fs_tools / jail boundaries.
+        - Prefer editing prompts, planner heuristics, notes, and non-critical
+          glue code rather than deep infrastructure changes.
+        - Ensure pytest passes for this project when you are done.
+        """
+    ).strip()
+
+
+def enqueue_self_improvement(ticket: Ticket) -> Path:
+    """
+    Create a queue item in data/queue/ for this ticket.
+
+    This is intentionally generic: your main orchestration loop can
+    read these JSON files and feed the `prompt` into Bob's planner
+    using whatever schema you're already using.
+    """
+    _ensure_dirs()
+
+    prompt = build_self_improvement_prompt(ticket)
+
+    queue_item = {
+        "kind": "self_improvement",
+        "ticket_id": ticket.id,
+        "scope": ticket.scope,
+        "prompt": prompt,
+        "safe_paths": ticket.safe_paths,
+        "created_at": ticket.created_at,
+        # You can add more fields here to match your existing plan schema.
+    }
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    fname = f"self_improvement_{ts}_{ticket.id}.json"
+    path = QUEUE_DIR / fname
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(queue_item, f, indent=2, ensure_ascii=False)
+    return path
+
+
+# ---------------------------------------------------------------------
+# Running self-improvement tickets directly (Bob + Chad)
+# ---------------------------------------------------------------------
+
+def run_self_improvement_prompt(prompt: str, ticket: Ticket) -> Dict[str, Any]:
+    """
+    Run a self-improvement cycle directly via Bob + Chad, without
+    going through the HTTP /api/chat route.
+
+    This reuses app.py's bob_build_plan / chad_execute_plan / next_message_id.
+    """
+    # Lazy import so this module doesn't require Flask on import.
+    from app import bob_build_plan, chad_execute_plan, next_message_id
+
+    _ensure_dirs()
+
+    # Generate a new message id, same format as UI.
+    id_str, date_str, base = next_message_id()
+
+    # Store the "user" prompt for traceability.
+    user_path = QUEUE_DIR / f"{base}.user.txt"
+    user_path.write_text(prompt + "\n", encoding="utf-8")
+
+    # Let Bob build a plan with tools enabled (we WANT codemods / tools).
+    plan = bob_build_plan(
+        id_str=id_str,
+        date_str=date_str,
+        base=base,
+        user_text=prompt,
+        tools_enabled=True,
+    )
+
+    # Chad executes the plan.
+    exec_report = chad_execute_plan(
+        id_str=id_str,
+        date_str=date_str,
+        base=base,
+        plan=plan,
+    )
+
+    # Apply the same-ish heuristic we used in app.py to log success/fail.
+    task = plan.get("task") or {}
+    task_type = task.get("type", "analysis")
+    edits = task.get("edits") or []
+    tool_obj = task.get("tool") or {}
+    edits_requested = len(edits)
+
+    touched_files = exec_report.get("touched_files") or []
+    edit_logs = exec_report.get("edit_logs") or []
+    msg_text = (exec_report.get("message") or "").lower()
+
+    result_label = "success"
+    tests_label = "not_run"  # we don't run pytest here (yet)
+    error_summary: Optional[str] = None
+
+    # Obvious failure words.
+    if "failed" in msg_text or "error" in msg_text:
+        result_label = "fail"
+        error_summary = exec_report.get("message")
+
+    # Codemod-specific heuristics.
+    if task_type == "codemod":
+        if edits_requested and not touched_files:
+            result_label = "fail"
+            reasons: list[str] = []
+            for e in edit_logs:
+                r = (e.get("reason") or "").strip()
+                if r and r not in reasons:
+                    reasons.append(r)
+                if len(reasons) >= 3:
+                    break
+            error_summary = (
+                "; ".join(reasons)
+                if reasons
+                else "codemod edits requested but no files were modified"
+            )
+        else:
+            serious_keywords = (
+                "escapes project jail",
+                "does not exist",
+                "not utf-8",
+                "not UTF-8",
+                "unknown operation",
+            )
+            serious_reasons: list[str] = []
+            for e in edit_logs:
+                r = (e.get("reason") or "").lower()
+                if any(k in r for k in serious_keywords):
+                    serious_reasons.append(e.get("reason") or r)
+            if serious_reasons:
+                result_label = "fail"
+                error_summary = "; ".join(serious_reasons[:3])
+
+    # Log this run into history as a "self" target.
+    try:
+        log_history_record(
+            target=META_TARGET_SELF,
+            result=result_label,
+            tests=tests_label,
+            error_summary=error_summary,
+            human_fix_required=False,
+            extra={
+                "id": id_str,
+                "base": base,
+                "ticket_id": ticket.id,
+                "task_type": task_type,
+                "tool_name": (tool_obj or {}).get("name"),
+                "touched_files": touched_files,
+            },
+        )
+    except Exception:
+        # Never let logging break self-improvement
+        pass
+
+    return {
+        "plan": plan,
+        "exec_report": exec_report,
+        "result_label": result_label,
+        "error_summary": error_summary,
+    }
+
+
+# ---------------------------------------------------------------------
+# CLI commands
+# ---------------------------------------------------------------------
+
+def cmd_analyse(args: argparse.Namespace) -> None:
+    history = load_history(limit=args.limit)
+    if not history:
+        print(f"[meta] No history found at {HISTORY_FILE}")
+        return
+
+    issues = detect_issues(history)
+    if not issues:
+        print("[meta] No issues detected (nice).")
+        return
+
+    print(f"[meta] Detected {len(issues)} recurring issue(s). Top {args.top}:")
+    for issue in issues[: args.top]:
+        print(
+            f"- {issue.key!r} | area={issue.area} | "
+            f"occurrences={len(issue.evidence_ids)}"
+        )
+
+
+def cmd_tickets(args: argparse.Namespace) -> None:
+    history = load_history(limit=args.limit)
+    issues = detect_issues(history)
+    tickets = issues_to_tickets(issues, scope=META_TARGET_SELF, limit=args.count)
+
+    if not tickets:
+        print("[meta] No tickets generated.")
+        return
+
+    print(f"[meta] Generated {len(tickets)} ticket(s):")
+    for t in tickets:
+        path = save_ticket(t)
+        print(f"- {t.id} [{t.priority}] -> {path}")
+
+
+def cmd_self_improve(args: argparse.Namespace) -> None:
+    history = load_history(limit=args.limit)
+    issues = detect_issues(history)
+    tickets = issues_to_tickets(issues, scope=META_TARGET_SELF, limit=args.count)
+
+    if not tickets:
+        print("[meta] No tickets generated, nothing to self-improve.")
+        return
+
+    print(f"[meta] Generated {len(tickets)} ticket(s) and enqueued self-improvement jobs:")
+    for t in tickets:
+        save_ticket(t)
+        qpath = enqueue_self_improvement(t)
+        print(f"- {t.id} [{t.priority}] -> queue item {qpath}")
+
+
+def cmd_self_cycle(args: argparse.Namespace) -> None:
+    """
+    Full loop in ONE command:
+
+    - Analyse history
+    - Generate up to `count` tickets
+    - For each ticket:
+        * Save ticket JSON
+        * Build self-improvement prompt
+        * Run Bob + Chad on that prompt directly
+        * Log result back into history
+
+    This is the "do it all" command:
+        python3 -m bob.meta self_cycle --count 3
+    """
+    history = load_history(limit=args.limit)
+    issues = detect_issues(history)
+    tickets = issues_to_tickets(issues, scope=META_TARGET_SELF, limit=args.count)
+
+    if not tickets:
+        print("[meta] No tickets generated, nothing to self-cycle.")
+        return
+
+    print(f"[meta] Self-cycle on {len(tickets)} ticket(s):")
+    for t in tickets:
+        save_ticket(t)
+        prompt = build_self_improvement_prompt(t)
+        result = run_self_improvement_prompt(prompt, t)
+        print(
+            f"- {t.id} [{t.priority}] → result={result['result_label']}, "
+            f"error={result['error_summary'] or '(none)'}"
+        )
+
+
+def cmd_teach_rule(args: argparse.Namespace) -> None:
+    """
+    Teach Bob a new internal planning rule.
+
+    This runs a small self-improvement cycle where the ONLY goal is to
+    persist the rule into a markdown note (planning-rules) using the
+    markdown note tools (create_markdown_note / append_to_markdown_note).
+    """
+    rule_text = (args.rule or "").strip()
+    if not rule_text:
+        print("[teach_rule] No rule provided.")
+        return
+
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    # Synthetic ticket just so logging still works nicely.
+    ticket = Ticket(
+        id=f"RULE-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}",
+        scope=META_TARGET_SELF,
+        area="planner",
+        title="Teach Bob a new planning rule",
+        description=f"Store this rule in Bob's internal notes:\n\n{rule_text}",
+        evidence=[rule_text],
+        priority="low",
+        created_at=now,
+        safe_paths=list(SAFE_SELF_PATHS),
+        raw_issue_key=f"rule:{abs(hash(rule_text)) % 100000}",
+    )
+
+    prompt = textwrap.dedent(
+        f"""
+        You are Bob running in SELF-TEACH mode.
+
+        We are adding a new internal planning rule that should guide your
+        future planning and codemod behaviour.
+
+        New rule:
+        {rule_text}
+
+        Your task:
+        - Persist this rule into your internal markdown notes.
+        - Use a note titled "planning-rules".
+        - If the note does not exist, create it using create_markdown_note.
+        - Then append the rule as a new bullet line starting with "- "
+          using append_to_markdown_note.
+
+        Constraints:
+        - Do NOT modify any project files except markdown notes in the
+          notes directory.
+        - Prefer a clear, concise phrasing of the rule.
+        - You must use one or both of the tools:
+          * create_markdown_note
+          * append_to_markdown_note
+        """
+    ).strip()
+
+    result = run_self_improvement_prompt(prompt, ticket)
+    print(
+        f"[teach_rule] result={result['result_label']}, "
+        f"error={result['error_summary'] or '(none)'}"
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Bob/Chad meta-layer utilities.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    # meta analyse
+    pa = sub.add_parser("analyse", help="Inspect history and list recurring issues.")
+    pa.add_argument("--limit", type=int, default=200, help="How many history records to inspect.")
+    pa.add_argument("--top", type=int, default=10, help="How many top issues to show.")
+    pa.set_defaults(func=cmd_analyse)
+
+    # meta tickets
+    pt = sub.add_parser("tickets", help="Generate tickets from history.")
+    pt.add_argument("--limit", type=int, default=200, help="How many history records to inspect.")
+    pt.add_argument("--count", type=int, default=5, help="Max number of tickets to create.")
+    pt.set_defaults(func=cmd_tickets)
+
+    # meta self_improve (tickets + queue)
+    ps = sub.add_parser(
+        "self_improve",
+        help="Generate tickets and enqueue self-improvement jobs for Bob/Chad.",
+    )
+    ps.add_argument("--limit", type=int, default=200, help="How many history records to inspect.")
+    ps.add_argument("--count", type=int, default=3, help="Max number of tickets / jobs.")
+    ps.set_defaults(func=cmd_self_improve)
+
+    # meta self_cycle (tickets + run them immediately)
+    pc = sub.add_parser(
+        "self_cycle",
+        help="Generate tickets and immediately run self-improvement via Bob/Chad.",
+    )
+    pc.add_argument("--limit", type=int, default=200, help="How many history records to inspect.")
+    pc.add_argument("--count", type=int, default=3, help="Max number of tickets to run.")
+    pc.set_defaults(func=cmd_self_cycle)
+
+    # meta teach_rule (direct self-teaching via notes)
+    pr = sub.add_parser(
+        "teach_rule",
+        help="Teach Bob a new internal planning rule (persisted to planning-rules note).",
+    )
+    pr.add_argument("rule", help="The rule text to teach Bob.")
+    pr.set_defaults(func=cmd_teach_rule)
+
+    return p
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
+
+
+import logging
+
+logger = logging.getLogger('bob')
+
+# Add utility logging function for warnings
+
+def log_warning(message):
+    """Log a warning message to assist debugging recurring file not found errors."""
+    logger.warning(message)
+
