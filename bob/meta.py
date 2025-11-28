@@ -560,6 +560,30 @@ def run_self_improvement_prompt(prompt: str, ticket: Ticket) -> Dict[str, Any]:
         tools_enabled=True,
     )
 
+    # ----------------------------
+    # Enforce ticket.safe_paths
+    # ----------------------------
+    task = plan.get("task") or {}
+    edits = task.get("edits") or []
+    if edits:
+        allowed = set(ticket.safe_paths)
+        filtered: list[dict[str, Any]] = []
+        dropped: list[str] = []
+
+        for e in edits:
+            rel = e.get("file")
+            if rel in allowed:
+                filtered.append(e)
+            else:
+                dropped.append(rel or "(none)")
+
+        if dropped:
+            # Minimal debug info in exec report / history logs
+            print(f"[meta] Dropped edits outside safe_paths: {dropped}")
+
+        task["edits"] = filtered
+        plan["task"] = task
+
     # Chad executes the plan.
     exec_report = chad_execute_plan(
         id_str=id_str,
@@ -1017,3 +1041,4 @@ logger = logging.getLogger('bob')
 def log_warning(message):
     """Log a warning message to assist debugging recurring file not found errors."""
     logger.warning(message)
+
