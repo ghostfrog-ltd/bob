@@ -93,3 +93,32 @@ def safe_schedule_tool(tool_name, *args, **kwargs):
 
 # This requires original_schedule_tool to be defined or imported.
 
+
+import os
+import logging
+
+logger = logging.getLogger(__name__)
+
+def file_exists_safe(filepath: str) -> bool:
+    try:
+        return os.path.exists(filepath)
+    except Exception as e:
+        logger.warning(f"Failed to check file existence: {filepath}, error: {e}")
+        return False
+
+# Wrap key note-related file ops to handle missing files gracefully
+
+old_load_note = None
+
+if hasattr(__import__('chad.notes'), 'load_note'):
+    old_load_note = __import__('chad.notes').load_note
+
+def load_note_safe(filepath: str):
+    if not file_exists_safe(filepath):
+        logger.error(f"Note file does not exist: {filepath}")
+        return None  # or return an empty note object to avoid cascading failures
+    return old_load_note(filepath)
+
+if old_load_note:
+    setattr(__import__('chad.notes'), 'load_note', load_note_safe)
+

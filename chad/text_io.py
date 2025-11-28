@@ -126,3 +126,26 @@ def safe_write_file(filepath: str, content: str):
     with open(filepath, 'w', encoding='utf-8') as f:
         f.write(content)
 
+
+import os
+
+
+def safe_read_file(filepath):
+    """Attempt to read a file safely, providing clear error if not found."""
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"Target file does not exist on disk: {filepath}")
+    with open(filepath, 'r', encoding='utf-8') as f:
+        return f.read()
+
+
+def safe_write_file(filepath, content):
+    """Write to a file safely, ensuring directory exists."""
+    dirpath = os.path.dirname(filepath)
+    if dirpath and not os.path.exists(dirpath):
+        os.makedirs(dirpath)
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(content)
+
+# Existing file operations should be updated in code that uses reading/writing files to use these safe functions where possible, catching FileNotFoundError and handling gracefully.
+
+
