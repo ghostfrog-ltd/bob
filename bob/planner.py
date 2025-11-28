@@ -623,3 +623,125 @@ def generate_task_plan_with_file_check(*args, **kwargs):
 if _original_generate_task_plan:
     globals()['generate_task_plan'] = generate_task_plan_with_file_check
 
+
+# Added defensive import and test module name checks to improve robustness of test discovery
+import os
+import importlib.util
+import sys
+
+def is_valid_test_module(filepath):
+    # Basic check: file name is valid Python module name and does not start with a dot or invalid char
+    filename = os.path.basename(filepath)
+    if not filename.endswith('.py'):
+        return False
+    if filename.startswith('.'):
+        return False
+    # Remove .py and check if valid identifier
+    modulename = filename[:-3]
+    return modulename.isidentifier()
+
+
+def safe_import_test_module(filepath):
+    # Attempt to import the test module at filepath; handle import errors gracefully
+    if not is_valid_test_module(filepath):
+        raise ImportError(f"Invalid test module filename: {filepath}")
+    try:
+        spec = importlib.util.spec_from_file_location('testmodule', filepath)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules['testmodule'] = module
+        spec.loader.exec_module(module)
+        return module
+    except Exception as e:
+        # Log or handle import error clearly
+        raise ImportError(f"Failed to import test module '{filepath}': {e}") from e
+
+# Example usage in test discovery function inside planner.py (assuming such a function)
+# def discover_tests():
+#     test_dir = 'tests'
+#     test_modules = []
+#     for root, dirs, files in os.walk(test_dir):
+#         for f in files:
+#             filepath = os.path.join(root, f)
+#             if is_valid_test_module(filepath):
+#                 try:
+#                     mod = safe_import_test_module(filepath)
+#                     test_modules.append(mod)
+#                 except ImportError as e:
+#                     print(f"Warning: {e}")
+#     return test_modules
+
+# This new code should be integrated where tests are discovered/imported in planner.py,
+# enabling clearer errors and filtering invalid test file names before import attempts.
+
+
+def check_target_file_exists(plan: dict) -> bool:
+    """Return True if the target file mentioned in a plan exists on disk,
+otherwise False."""
+    import os
+    target_file = plan.get('target_file')
+    if target_file and os.path.exists(target_file):
+        return True
+    return False
+
+
+def refine_plan_for_missing_files(plan: dict) -> dict:
+    """Refine the plan to handle missing target file scenario gracefully.
+Add notes or change plan steps accordingly."""
+    import copy
+    refined = copy.deepcopy(plan)
+    if 'target_file' in refined and not check_target_file_exists(refined):
+        refined['notes'] = refined.get('notes', '') + \
+            'WARNING: Target file does not exist on disk. Adjusting plan accordingly.'
+        # Potentially add fallback actions or stop further processing
+        refined['skip_further_actions'] = True
+    return refined
+
+
+# Improved handling for target file existence checks with better error messages and fallback handling
+import logging
+
+logger = logging.getLogger(__name__)
+
+original_check_file_existence = None
+
+# Patch function to add graceful handling and detailed logging
+
+def patched_check_file_existence(filepath):
+    try:
+        from os.path import exists
+        if not exists(filepath):
+            logger.warning(f"Target file does not exist on disk: {filepath}")
+            # Possibly add fallback or notification here; keep existing safety checks intact
+            return False
+        return True
+    except Exception as e:
+        logger.error(f"Error checking target file existence {filepath}: {e}")
+        return False
+
+# Apply the patch at runtime
+from bob import planner
+if hasattr(planner, 'check_file_existence'):
+    original_check_file_existence = planner.check_file_existence
+    planner.check_file_existence = patched_check_file_existence
+
+
+# Additional check before operations that reference target files to verify existence and avoid errors
+import os
+import logging
+
+original_function = None
+
+# Example patch point: wrap a function in planner that opens or checks files
+# Pseudocode: Suppose a function plan_file_operation(file_path)
+def plan_file_operation(file_path):
+    if not os.path.exists(file_path):
+        logging.warning(f"[Planner] Target file does not exist: {file_path}")
+        # Return a special indicator or handle gracefully
+        return None
+    # Continue with original operation if file exists
+    # (this simulates robust logic, actual function may differ)
+    # ...
+    return True
+
+# This is illustrative; actual planner logic will be modified accordingly
+

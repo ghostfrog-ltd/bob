@@ -29,6 +29,126 @@ from pathlib import Path
 from typing import Iterable, List, Dict, Any, Tuple, Optional
 
 from .meta_log import log_history_record  # local helper for history logging
+import subprocess
+
+
+# ---------------------------------------------------------------------
+# Safe snapshot / restore of self-editable files
+# ---------------------------------------------------------------------
+
+def _run_pytest(timeout: int = 300) -> Tuple[bool, str]:
+    """
+    Run pytest, return (success, output).
+    """
+    try:
+        proc = subprocess.run(
+            ["pytest"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception as e:
+        return False, f"pytest crashed: {e}"
+
+    ok = proc.returncode == 0
+    out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    return ok, out
+
+
+def run_ticket_with_tests(ticket: Ticket, max_attempts: int = 2) -> Dict[str, Any]:
+    """
+    For a single ticket:
+
+    - snapshot SAFE_SELF_PATHS
+    - run self-improvement once
+    - run pytest
+    - if tests fail: restore snapshot & retry (up to max_attempts)
+    - log outcomes to history
+    """
+    attempts: List[Dict[str, Any]] = []
+    success = False
+    last_error: Optional[str] = None
+
+    for attempt in range(1, max_attempts + 1):
+        snap = _snapshot_files(ticket.safe_paths)
+
+        prompt = build_self_improvement_prompt(ticket)
+        result = run_self_improvement_prompt(prompt, ticket)
+
+        # After codemod, run tests
+        tests_ok, pytest_out = _run_pytest()
+        tests_label = "pass" if tests_ok else "fail"
+
+        # Log a dedicated history record for the test outcome
+        try:
+            log_history_record(
+                target=META_TARGET_SELF,
+                result="success" if tests_ok else "fail",
+                tests=tests_label,
+                error_summary=None if tests_ok else pytest_out[:800],
+                human_fix_required=not tests_ok,
+                extra={
+                    "ticket_id": ticket.id,
+                    "attempt": attempt,
+                    "self_cycle": True,
+                },
+            )
+        except Exception:
+            # Never break self-repair just because logging failed
+            pass
+
+        attempts.append(
+            {
+                "attempt": attempt,
+                "result_label": result.get("result_label"),
+                "error_summary": result.get("error_summary"),
+                "tests_ok": tests_ok,
+                "pytest_output": pytest_out,
+            }
+        )
+
+        if tests_ok:
+            success = True
+            break
+
+        # Tests failed → revert code and try again
+        last_error = pytest_out
+        _restore_files(snap)
+
+    return {
+        "success": success,
+        "attempts": attempts,
+        "last_error": last_error,
+    }
+
+def _snapshot_files(rel_paths: List[str]) -> Dict[str, Optional[str]]:
+    """
+    Take an in-memory snapshot of the files Bob is allowed to touch.
+
+    Key = relative path (from ROOT_DIR), value = file contents or None if missing.
+    """
+    snap: Dict[str, Optional[str]] = {}
+    for rel in rel_paths:
+        p = ROOT_DIR / rel
+        if p.exists():
+            snap[rel] = p.read_text(encoding="utf-8")
+        else:
+            snap[rel] = None
+    return snap
+
+
+def _restore_files(snapshot: Dict[str, Optional[str]]) -> None:
+    """
+    Restore files from a snapshot. If value is None, remove file if it exists.
+    """
+    for rel, content in snapshot.items():
+        p = ROOT_DIR / rel
+        if content is None:
+            if p.exists():
+                p.unlink()
+        else:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
 
 # ---------------------------------------------------------------------
 # Paths / constants
@@ -542,17 +662,29 @@ def cmd_self_cycle(args: argparse.Namespace) -> None:
     """
     Full loop in ONE command:
 
+    - Run baseline pytest (abort if already failing)
     - Analyse history
     - Generate up to `count` tickets
     - For each ticket:
         * Save ticket JSON
-        * Build self-improvement prompt
-        * Run Bob + Chad on that prompt directly
+        * Run Bob + Chad on that ticket (self-improvement)
+        * Run pytest
+        * If tests fail, restore snapshot and retry
         * Log result back into history
 
     This is the "do it all" command:
-        python3 -m bob.meta self_cycle --count 3
+        python3 -m bob.meta self_cycle --count 3 --retries 2
     """
+    # 0) Baseline sanity check
+    print("[meta] Running baseline tests before self-cycle...")
+    baseline_ok, baseline_out = _run_pytest()
+    if not baseline_ok:
+        print("[meta] Baseline pytest FAILED. Aborting self_cycle.")
+        print("Baseline error (truncated):")
+        print(" ", (baseline_out or "")[:400].replace("\n", "\n  "))
+        return
+
+    # 1) Normal self-cycle flow
     history = load_history(limit=args.limit)
     issues = detect_issues(history)
     tickets = issues_to_tickets(issues, scope=META_TARGET_SELF, limit=args.count)
@@ -564,12 +696,20 @@ def cmd_self_cycle(args: argparse.Namespace) -> None:
     print(f"[meta] Self-cycle on {len(tickets)} ticket(s):")
     for t in tickets:
         save_ticket(t)
-        prompt = build_self_improvement_prompt(t)
-        result = run_self_improvement_prompt(prompt, t)
-        print(
-            f"- {t.id} [{t.priority}] → result={result['result_label']}, "
-            f"error={result['error_summary'] or '(none)'}"
-        )
+        summary = run_ticket_with_tests(t, max_attempts=args.retries)
+
+        status = "OK" if summary["success"] else "FAILED"
+        print(f"- {t.id} [{t.priority}] → {status}")
+        for att in summary["attempts"]:
+            print(
+                f"    attempt {att['attempt']}: "
+                f"plan_result={att['result_label']} tests_ok={att['tests_ok']}"
+            )
+        if not summary["success"]:
+            print("    last pytest error (truncated):")
+            if summary["last_error"]:
+                print("    ", summary["last_error"][:400].replace("\n", "\n    "))
+
 
 
 def cmd_teach_rule(args: argparse.Namespace) -> None:
@@ -667,6 +807,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pc.add_argument("--limit", type=int, default=200, help="How many history records to inspect.")
     pc.add_argument("--count", type=int, default=3, help="Max number of tickets to run.")
+    pc.add_argument(
+        "--retries",
+        type=int,
+        default=2,
+        help="Max attempts per ticket (with restore on failed tests).",
+    )
     pc.set_defaults(func=cmd_self_cycle)
 
     # meta teach_rule (direct self-teaching via notes)
