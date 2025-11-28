@@ -1,4 +1,3 @@
-# bob/meta.py
 from __future__ import annotations
 
 """
@@ -23,14 +22,203 @@ Responsibilities
 
 import argparse
 import json
+import logging
+import subprocess
 import textwrap
+import hashlib
 from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Iterable, List, Dict, Any, Tuple, Optional
 
 from .meta_log import log_history_record  # local helper for history logging
-import subprocess
+
+logger = logging.getLogger("bob")
+
+
+def log_warning(message: str) -> None:
+    """Log a warning message to assist debugging recurring file not found or jail errors."""
+    logger.warning(message)
+
+
+# Meta metadata about enhanced path safety improvements
+path_safety_enhancements = {
+    "description": "Additional path validation and absolute path jail enforcement added in planner and notes modules",
+    "priority": "low",
+    "goal": "Prevent target path escapes from project jail without weakening fs_tools core safety",
+    "status": "implemented",
+}
+
+
+# ---------------------------------------------------------------------
+# Paths / constants
+# ---------------------------------------------------------------------
+
+ROOT_DIR = Path(__file__).resolve().parents[1]  # .../ghostfrog-project-bob
+DATA_DIR = ROOT_DIR / "data"
+META_DIR = DATA_DIR / "meta"
+HISTORY_FILE = META_DIR / "history.jsonl"  # append-only JSONL
+TICKETS_DIR = META_DIR / "tickets"
+QUEUE_DIR = DATA_DIR / "queue"
+TICKET_HISTORY_PATH = META_DIR / "tickets_history.jsonl"
+
+# Files we're willing to let the system touch in "self" mode.
+SAFE_SELF_PATHS: Tuple[str, ...] = (
+    "bob/config.py",
+    "bob/planner.py",
+    "bob/schema.py",
+    "chad/notes.py",
+    "chad/text_io.py",
+    "bob/meta.py",
+)
+
+META_TARGET_SELF = "self"
+META_TARGET_GF = "ghostfrog"  # label for your main project runs
+
+
+# ---------------------------------------------------------------------
+# Data models
+# ---------------------------------------------------------------------
+
+@dataclass
+class HistoryRecord:
+    """Single run of Bob/Chad on some task (real project or self)."""
+
+    ts: str
+    target: str
+    result: str
+    tests: str | None = None
+    error_summary: str | None = None
+    human_fix_required: bool | None = None
+    extra: Dict[str, Any] | None = None
+
+
+@dataclass
+class Issue:
+    """An aggregated failure pattern across many HistoryRecords."""
+
+    key: str  # stable key for grouping (e.g. error slug)
+    area: str  # planner / executor / fs_tools / tests / other
+    description: str  # human-readable description
+    evidence_ids: List[int]  # line numbers or indices in history
+    examples: List[str]  # short error snippets
+
+
+@dataclass
+class Ticket:
+    """
+    Concrete self-improvement ticket that Bob/Chad can act on.
+
+    This is intentionally generic: you can feed the 'prompt' field
+    into Bob's planner as the "user message" if you like.
+    """
+
+    id: str
+    scope: str  # "self" or "ghostfrog" / etc.
+    area: str  # planner / executor / fs_tools / tests / other
+    title: str
+    description: str
+    evidence: List[str]
+    priority: str  # low / medium / high
+    created_at: str
+    safe_paths: List[str]  # paths allowed for auto-editing
+    raw_issue_key: str
+
+
+# ---------------------------------------------------------------------
+# Ticket history helpers (de-duplication)
+# ---------------------------------------------------------------------
+
+def _append_ticket_history(
+    fingerprint: str,
+    status: str,
+    extra: Dict[str, Any] | None = None,
+) -> None:
+    """
+    Append a single ticket outcome to a JSONL history file.
+    status: 'created', 'completed', 'failed', etc.
+    """
+    TICKET_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    record: Dict[str, Any] = {
+        "ts": datetime.now(tz=timezone.utc).isoformat(),
+        "fingerprint": fingerprint,
+        "status": status,
+    }
+    if extra:
+        record.update(extra)
+    with TICKET_HISTORY_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def _ticket_recently_completed(
+    fingerprint: str,
+    lookback_hours: int = 24,
+) -> bool:
+    """
+    Return True if this ticket fingerprint has a 'completed' record
+    within the last `lookback_hours`.
+    """
+    if not TICKET_HISTORY_PATH.exists():
+        return False
+
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=lookback_hours)
+
+    with TICKET_HISTORY_PATH.open("r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            if rec.get("fingerprint") != fingerprint:
+                continue
+            if rec.get("status") != "completed":
+                continue
+
+            try:
+                ts = datetime.fromisoformat(rec["ts"])
+            except Exception:
+                continue
+
+            if ts >= cutoff:
+                return True
+
+    return False
+
+
+def _ticket_fingerprint(ticket: Ticket | Dict[str, Any]) -> str:
+    """
+    Compute a stable fingerprint for a ticket based on its semantic content,
+    not the random ticket_id. This lets us de-duplicate 'same idea' tickets.
+
+    Supports both Ticket dataclass and dict-shaped tickets.
+    """
+    if isinstance(ticket, Ticket):
+        component = ticket.area
+        title = ticket.title
+        summary = ticket.description
+    else:
+        component = ticket.get("component") or ticket.get("area") or ""
+        title = ticket.get("title") or ""
+        summary = ticket.get("summary") or ticket.get("description") or ""
+
+    key_parts = {
+        "component": component,
+        "title": title,
+        "summary": summary,
+    }
+    raw = json.dumps(key_parts, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def mark_ticket_failed(ticket: Ticket | Dict[str, Any], reason: str) -> None:
+    fp = _ticket_fingerprint(ticket)
+    _append_ticket_history(fp, "failed", {"reason": reason})
+
+
+def mark_ticket_completed(ticket: Ticket | Dict[str, Any]) -> None:
+    fp = _ticket_fingerprint(ticket)
+    _append_ticket_history(fp, "completed")
 
 
 # ---------------------------------------------------------------------
@@ -54,6 +242,36 @@ def _run_pytest(timeout: int = 300) -> Tuple[bool, str]:
     ok = proc.returncode == 0
     out = (proc.stdout or "") + "\n" + (proc.stderr or "")
     return ok, out
+
+
+def _snapshot_files(rel_paths: List[str]) -> Dict[str, Optional[str]]:
+    """
+    Take an in-memory snapshot of the files Bob is allowed to touch.
+
+    Key = relative path (from ROOT_DIR), value = file contents or None if missing.
+    """
+    snap: Dict[str, Optional[str]] = {}
+    for rel in rel_paths:
+        p = ROOT_DIR / rel
+        if p.exists():
+            snap[rel] = p.read_text(encoding="utf-8")
+        else:
+            snap[rel] = None
+    return snap
+
+
+def _restore_files(snapshot: Dict[str, Optional[str]]) -> None:
+    """
+    Restore files from a snapshot. If value is None, remove file if it exists.
+    """
+    for rel, content in snapshot.items():
+        p = ROOT_DIR / rel
+        if content is None:
+            if p.exists():
+                p.unlink()
+        else:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
 
 
 def run_ticket_with_tests(ticket: Ticket, max_attempts: int = 2) -> Dict[str, Any]:
@@ -123,109 +341,8 @@ def run_ticket_with_tests(ticket: Ticket, max_attempts: int = 2) -> Dict[str, An
     }
 
 
-def _snapshot_files(rel_paths: List[str]) -> Dict[str, Optional[str]]:
-    """
-    Take an in-memory snapshot of the files Bob is allowed to touch.
-
-    Key = relative path (from ROOT_DIR), value = file contents or None if missing.
-    """
-    snap: Dict[str, Optional[str]] = {}
-    for rel in rel_paths:
-        p = ROOT_DIR / rel
-        if p.exists():
-            snap[rel] = p.read_text(encoding="utf-8")
-        else:
-            snap[rel] = None
-    return snap
-
-
-def _restore_files(snapshot: Dict[str, Optional[str]]) -> None:
-    """
-    Restore files from a snapshot. If value is None, remove file if it exists.
-    """
-    for rel, content in snapshot.items():
-        p = ROOT_DIR / rel
-        if content is None:
-            if p.exists():
-                p.unlink()
-        else:
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(content, encoding="utf-8")
-
-
 # ---------------------------------------------------------------------
-# Paths / constants
-# ---------------------------------------------------------------------
-
-ROOT_DIR = Path(__file__).resolve().parents[1]  # .../ghostfrog-project-bob
-DATA_DIR = ROOT_DIR / "data"
-META_DIR = DATA_DIR / "meta"
-HISTORY_FILE = META_DIR / "history.jsonl"  # append-only JSONL
-TICKETS_DIR = META_DIR / "tickets"
-QUEUE_DIR = DATA_DIR / "queue"
-
-# Files we're willing to let the system touch in "self" mode.
-SAFE_SELF_PATHS: Tuple[str, ...] = (
-    "bob/config.py",
-    "bob/planner.py",
-    "bob/schema.py",
-    "chad/notes.py",
-    "chad/text_io.py",
-    "bob/meta.py"
-)
-
-META_TARGET_SELF = "self"
-META_TARGET_GF = "ghostfrog"  # label for your main project runs
-
-
-# ---------------------------------------------------------------------
-# Data models
-# ---------------------------------------------------------------------
-
-@dataclass
-class HistoryRecord:
-    """Single run of Bob/Chad on some task (real project or self)."""
-    ts: str
-    target: str
-    result: str
-    tests: str | None = None
-    error_summary: str | None = None
-    human_fix_required: bool | None = None
-    extra: Dict[str, Any] | None = None
-
-
-@dataclass
-class Issue:
-    """An aggregated failure pattern across many HistoryRecords."""
-    key: str  # stable key for grouping (e.g. error slug)
-    area: str  # planner / executor / fs_tools / tests / other
-    description: str  # human-readable description
-    evidence_ids: List[int]  # line numbers or indices in history
-    examples: List[str]  # short error snippets
-
-
-@dataclass
-class Ticket:
-    """
-    Concrete self-improvement ticket that Bob/Chad can act on.
-
-    This is intentionally generic: you can feed the 'prompt' field
-    into Bob's planner as the "user message" if you like.
-    """
-    id: str
-    scope: str  # "self" or "ghostfrog" / etc.
-    area: str  # planner / executor / fs_tools / tests / other
-    title: str
-    description: str
-    evidence: List[str]
-    priority: str  # low / medium / high
-    created_at: str
-    safe_paths: List[str]  # paths allowed for auto-editing
-    raw_issue_key: str
-
-
-# ---------------------------------------------------------------------
-# Utilities
+# History loading / issue detection
 # ---------------------------------------------------------------------
 
 def _ensure_dirs() -> None:
@@ -249,24 +366,26 @@ def _parse_history_line(line: str) -> Optional[HistoryRecord]:
         target=data.get("target") or "unknown",
         result=data.get("result") or "unknown",
         tests=data.get("tests"),
-        error_summary=data.get("error_summary") or data.get("error") or data.get("traceback"),
+        error_summary=data.get("error_summary")
+        or data.get("error")
+        or data.get("traceback"),
         human_fix_required=data.get("human_fix_required"),
         extra={
-                  k: v
-                  for k, v in data.items()
-                  if k
-                     not in {
-                         "ts",
-                         "target",
-                         "result",
-                         "tests",
-                         "error_summary",
-                         "error",
-                         "traceback",
-                         "human_fix_required",
-                     }
-              }
-              or None,
+            k: v
+            for k, v in data.items()
+            if k
+            not in {
+                "ts",
+                "target",
+                "result",
+                "tests",
+                "error_summary",
+                "error",
+                "traceback",
+                "human_fix_required",
+            }
+        }
+        or None,
     )
 
 
@@ -359,9 +478,9 @@ def _make_ticket_id(issue: Issue) -> str:
 
 
 def issues_to_tickets(
-        issues: Iterable[Issue],
-        scope: str = META_TARGET_SELF,
-        limit: int = 5,
+    issues: Iterable[Issue],
+    scope: str = META_TARGET_SELF,
+    limit: int = 5,
 ) -> List[Ticket]:
     tickets: List[Ticket] = []
     for issue in issues:
@@ -484,6 +603,7 @@ def enqueue_self_improvement(ticket: Ticket) -> Path:
         json.dump(queue_item, f, indent=2, ensure_ascii=False)
     return path
 
+
 def _extract_user_text(extra: Optional[Dict[str, Any]]) -> Optional[str]:
     """
     Try hard to pull a user_text-like field out of a history.extra blob.
@@ -529,6 +649,7 @@ def _extract_user_text(extra: Optional[Dict[str, Any]]) -> Optional[str]:
 
     return None
 
+
 # ---------------------------------------------------------------------
 # Running self-improvement tickets directly (Bob + Chad)
 # ---------------------------------------------------------------------
@@ -564,7 +685,6 @@ def run_self_improvement_prompt(prompt: str, ticket: Ticket) -> Dict[str, Any]:
     # ----------------------------
     # Enforce ticket.safe_paths
     # ----------------------------
-    # Enforce ticket.safe_paths: drop any edits to files outside the whitelist
     task = plan.get("task") or {}
     edits = task.get("edits") or []
     if edits:
@@ -734,7 +854,9 @@ def cmd_repair_then_retry(args: argparse.Namespace) -> None:
         # Help you debug what's actually in extra
         last = failed_ghostfrog[-1]
         keys = sorted((last.extra or {}).keys())
-        print("[repair_then_retry] Failed ghostfrog jobs exist but none have usable user_text.")
+        print(
+            "[repair_then_retry] Failed ghostfrog jobs exist but none have usable user_text."
+        )
         print(f"  Last failed record ts={last.ts}, extra keys={keys}")
         return
 
@@ -751,7 +873,9 @@ def cmd_repair_then_retry(args: argparse.Namespace) -> None:
             tools_enabled = te
         else:
             nested = failed_real.extra.get("extra")
-            if isinstance(nested, dict) and isinstance(nested.get("tools_enabled"), bool):
+            if isinstance(nested, dict) and isinstance(
+                nested.get("tools_enabled"), bool
+            ):
                 tools_enabled = nested["tools_enabled"]
 
     # 2) Run a mini self-cycle (1 ticket, 1 retry)
@@ -817,7 +941,6 @@ def cmd_repair_then_retry(args: argparse.Namespace) -> None:
         print(f"  error={error_summary[:300]}")
 
 
-
 def cmd_tickets(args: argparse.Namespace) -> None:
     history = load_history(limit=args.limit)
     issues = detect_issues(history)
@@ -842,11 +965,32 @@ def cmd_self_improve(args: argparse.Namespace) -> None:
         print("[meta] No tickets generated, nothing to self-improve.")
         return
 
-    print(f"[meta] Generated {len(tickets)} ticket(s) and enqueued self-improvement jobs:")
+    print(
+        f"[meta] Generated {len(tickets)} ticket(s) and enqueued self-improvement jobs:"
+    )
     for t in tickets:
         save_ticket(t)
         qpath = enqueue_self_improvement(t)
         print(f"- {t.id} [{t.priority}] -> queue item {qpath}")
+
+
+def _filter_new_tickets(tickets: List[Ticket]) -> List[Ticket]:
+    """
+    De-duplicate tickets based on semantic fingerprint.
+
+    Only new (not recently completed) tickets are returned.
+    """
+    filtered: List[Ticket] = []
+    for t in tickets:
+        fp = _ticket_fingerprint(t)
+        if _ticket_recently_completed(fp):
+            print(
+                f"[self_cycle] Skipping ticket (already completed recently): {t.title}"
+            )
+            continue
+        _append_ticket_history(fp, "created")
+        filtered.append(t)
+    return filtered
 
 
 def cmd_self_cycle(args: argparse.Namespace) -> None:
@@ -878,7 +1022,11 @@ def cmd_self_cycle(args: argparse.Namespace) -> None:
     # 1) Normal self-cycle flow
     history = load_history(limit=args.limit)
     issues = detect_issues(history)
-    tickets = issues_to_tickets(issues, scope=META_TARGET_SELF, limit=args.count)
+    raw_tickets = issues_to_tickets(
+        issues, scope=META_TARGET_SELF, limit=args.count
+    )
+
+    tickets = _filter_new_tickets(raw_tickets)
 
     if not tickets:
         print("[meta] No tickets generated, nothing to self-cycle.")
@@ -897,9 +1045,15 @@ def cmd_self_cycle(args: argparse.Namespace) -> None:
                 f"plan_result={att['result_label']} tests_ok={att['tests_ok']}"
             )
         if not summary["success"]:
+            mark_ticket_failed(t, summary.get("last_error") or "pytest failed")
             print("    last pytest error (truncated):")
             if summary["last_error"]:
-                print("    ", summary["last_error"][:400].replace("\n", "\n    "))
+                print(
+                    "    ",
+                    summary["last_error"][:400].replace("\n", "\n    "),
+                )
+        else:
+            mark_ticket_completed(t)
 
 
 def cmd_teach_rule(args: argparse.Namespace) -> None:
@@ -971,14 +1125,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     # meta analyse
     pa = sub.add_parser("analyse", help="Inspect history and list recurring issues.")
-    pa.add_argument("--limit", type=int, default=200, help="How many history records to inspect.")
-    pa.add_argument("--top", type=int, default=10, help="How many top issues to show.")
+    pa.add_argument(
+        "--limit", type=int, default=200, help="How many history records to inspect."
+    )
+    pa.add_argument(
+        "--top", type=int, default=10, help="How many top issues to show."
+    )
     pa.set_defaults(func=cmd_analyse)
 
     # meta tickets
     pt = sub.add_parser("tickets", help="Generate tickets from history.")
-    pt.add_argument("--limit", type=int, default=200, help="How many history records to inspect.")
-    pt.add_argument("--count", type=int, default=5, help="Max number of tickets to create.")
+    pt.add_argument(
+        "--limit", type=int, default=200, help="How many history records to inspect."
+    )
+    pt.add_argument(
+        "--count", type=int, default=5, help="Max number of tickets to create."
+    )
     pt.set_defaults(func=cmd_tickets)
 
     # meta self_improve (tickets + queue)
@@ -986,8 +1148,12 @@ def build_parser() -> argparse.ArgumentParser:
         "self_improve",
         help="Generate tickets and enqueue self-improvement jobs for Bob/Chad.",
     )
-    ps.add_argument("--limit", type=int, default=200, help="How many history records to inspect.")
-    ps.add_argument("--count", type=int, default=3, help="Max number of tickets / jobs.")
+    ps.add_argument(
+        "--limit", type=int, default=200, help="How many history records to inspect."
+    )
+    ps.add_argument(
+        "--count", type=int, default=3, help="Max number of tickets / jobs."
+    )
     ps.set_defaults(func=cmd_self_improve)
 
     # meta self_cycle (tickets + run them immediately)
@@ -995,8 +1161,12 @@ def build_parser() -> argparse.ArgumentParser:
         "self_cycle",
         help="Generate tickets and immediately run self-improvement via Bob/Chad.",
     )
-    pc.add_argument("--limit", type=int, default=200, help="How many history records to inspect.")
-    pc.add_argument("--count", type=int, default=3, help="Max number of tickets to run.")
+    pc.add_argument(
+        "--limit", type=int, default=200, help="How many history records to inspect."
+    )
+    pc.add_argument(
+        "--count", type=int, default=3, help="Max number of tickets to run."
+    )
     pc.add_argument(
         "--retries",
         type=int,
@@ -1031,26 +1201,3 @@ def main(argv: Optional[List[str]] = None) -> None:
 
 if __name__ == "__main__":
     main()
-
-import logging
-
-logger = logging.getLogger('bob')
-
-
-# Add utility logging function for warnings
-
-def log_warning(message):
-    """Log a warning message to assist debugging recurring file not found errors."""
-    logger.warning(message)
-
-
-# Add meta metadata about enhanced path safety improvements
-# Mark this as a low priority mitigation attempt for recurring 'target path escapes project jail' failure
-
-path_safety_enhancements = {
-    'description': 'Additional path validation and absolute path jail enforcement added in planner and notes modules',
-    'priority': 'low',
-    'goal': 'Prevent target path escapes from project jail without weakening fs_tools core safety',
-    'status': 'implemented'
-}
-
