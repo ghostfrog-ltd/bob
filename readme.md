@@ -18,3 +18,12 @@ python3 -m bob.meta teach_rule "When planning self-improvement codemods, avoid p
 
 # 5) Repair and retry
 python3 -m bob.meta repair_then_retry
+
+# 6) create a new ticket
+
+python3 -m bob.meta new_ticket \
+  --title "Fix TOOL_REGISTRY drift" \
+  --area planner \
+  --priority medium \
+  --paths bob/tools_registry.py bob/meta.py
+

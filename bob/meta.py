@@ -20,6 +20,7 @@ Responsibilities
     internal planning rule in his markdown notes.
 """
 
+from uuid import uuid4
 import argparse
 import json
 import logging
@@ -30,8 +31,8 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Iterable, List, Dict, Any, Tuple, Optional
-
-from .meta_log import log_history_record  # local helper for history logging
+from dataclasses import fields as dataclass_fields
+from .meta_log import log_history_record
 
 logger = logging.getLogger("bob")
 
@@ -74,6 +75,108 @@ SAFE_SELF_PATHS: Tuple[str, ...] = (
 
 META_TARGET_SELF = "self"
 META_TARGET_GF = "ghostfrog"  # label for your main project runs
+
+
+
+def cmd_new_ticket(args: argparse.Namespace) -> None:
+    """
+    Create a new manual Ticket JSON on disk, but do NOT enqueue it.
+
+    You can then open the JSON in your editor, tweak title/description/safe_paths/etc,
+    and later enqueue it with `enqueue_ticket`.
+    """
+    _ensure_dirs()
+
+    title = (args.title or "").strip()
+    if not title:
+        title = "Manual ticket (edit me)"
+
+    description = (args.description or "").strip()
+    if not description:
+        description = (
+            "Manual ticket created via `meta new_ticket`.\n\n"
+            "Edit this description, evidence, priority, and safe_paths before enqueuing."
+        )
+
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    # Use provided paths or default SAFE_SELF_PATHS
+    safe_paths: List[str]
+    if args.paths:
+        safe_paths = [p.strip() for p in args.paths if p.strip()]
+    else:
+        safe_paths = list(SAFE_SELF_PATHS)
+
+    ticket_id = f"MANUAL-{uuid4().hex[:8]}"
+
+    ticket = Ticket(
+        id=ticket_id,
+        scope=args.scope or META_TARGET_SELF,
+        area=args.area,
+        title=title,
+        description=description,
+        evidence=["(edit me)"],
+        priority=args.priority,
+        created_at=now,
+        safe_paths=safe_paths,
+        raw_issue_key=f"manual:{ticket_id}",
+    )
+
+    path = save_ticket(ticket)
+    print("[new_ticket] Created skeleton ticket JSON:")
+    print(f"  {path}")
+    print()
+    print("Next steps:")
+    print("  1) Open that file in your editor and change:")
+    print("       - title / description")
+    print("       - evidence[]")
+    print("       - priority")
+    print("       - safe_paths[] (which files Bob is allowed to touch)")
+    print("  2) Enqueue it when ready with:")
+    print(f"       python3 -m bob.meta enqueue_ticket --file {path}")
+
+
+def _load_ticket_from_path(path: Path) -> Ticket:
+    """
+    Load a Ticket dataclass from a JSON file written by save_ticket/new_ticket.
+
+    Ignores any extra keys (e.g. 'kind', 'ticket_id') so you don't crash
+    if the JSON is a bit noisier than the Ticket dataclass.
+    """
+    raw = json.loads(path.read_text(encoding="utf-8"))
+
+    # Only keep keys that exist on the Ticket dataclass
+    valid_keys = {f.name for f in dataclass_fields(Ticket)}
+    filtered = {k: v for k, v in raw.items() if k in valid_keys}
+
+    return Ticket(**filtered)
+
+
+def cmd_enqueue_ticket(args: argparse.Namespace) -> None:
+    """
+    Read a Ticket JSON from disk (that you've edited) and enqueue
+    a self_improvement job for Bob/Chad.
+    """
+    path = Path(args.file)
+    if not path.exists():
+        print(f"[enqueue_ticket] File not found: {path}")
+        return
+
+    try:
+        ticket = _load_ticket_from_path(path)
+    except Exception as e:
+        print(f"[enqueue_ticket] Failed to load ticket JSON: {e}")
+        return
+
+    qpath = enqueue_self_improvement(ticket)
+    print(f"[enqueue_ticket] Enqueued queue item:")
+    print(f"  {qpath}")
+    print()
+    print(f"Ticket id: {ticket.id}")
+    print(f"Title:     {ticket.title}")
+    print(f"Area:      {ticket.area}")
+    print(f"Priority:  {ticket.priority}")
+    print(f"Scope:     {ticket.scope}")
 
 
 # ---------------------------------------------------------------------
@@ -1189,6 +1292,63 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pr.add_argument("rule", help="The rule text to teach Bob.")
     pr.set_defaults(func=cmd_teach_rule)
+
+    # meta new_ticket (skeleton ticket you can edit)
+    pnt = sub.add_parser(
+        "new_ticket",
+        help="Create a new skeleton manual ticket JSON (not enqueued).",
+    )
+    pnt.add_argument(
+        "--title",
+        default="Manual ticket (edit me)",
+        help="Initial title for the ticket (you can edit in JSON).",
+    )
+    pnt.add_argument(
+        "--desc",
+        "--description",
+        dest="description",
+        default="",
+        help="Initial description (you can edit in JSON).",
+    )
+    pnt.add_argument(
+        "--area",
+        choices=["planner", "executor", "fs_tools", "tests", "other"],
+        default="other",
+        help="Rough area this ticket relates to.",
+    )
+    pnt.add_argument(
+        "--priority",
+        choices=["low", "medium", "high"],
+        default="medium",
+        help="Ticket priority.",
+    )
+    pnt.add_argument(
+        "--scope",
+        default=META_TARGET_SELF,
+        help="Scope label (default: self).",
+    )
+    pnt.add_argument(
+        "--paths",
+        nargs="*",
+        default=[],
+        help=(
+            "Safe paths Bob is allowed to edit for this ticket "
+            "(default: SAFE_SELF_PATHS)."
+        ),
+    )
+    pnt.set_defaults(func=cmd_new_ticket)
+
+    # meta enqueue_ticket (take edited ticket JSON and enqueue it)
+    pet = sub.add_parser(
+        "enqueue_ticket",
+        help="Enqueue a previously-created Ticket JSON for self_improvement.",
+    )
+    pet.add_argument(
+        "--file",
+        required=True,
+        help="Path to the ticket JSON (created by new_ticket / save_ticket).",
+    )
+    pet.set_defaults(func=cmd_enqueue_ticket)
 
     return p
 
