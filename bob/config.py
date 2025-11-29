@@ -11,10 +11,13 @@ from openai import OpenAI
 @lru_cache(maxsize=1)
 def get_openai_client() -> Optional[OpenAI]:
     """
-    Shared OpenAI client for Bob.
+    Return a cached OpenAI client configured with the API key from the environment.
 
-    Returns None if OPENAI_API_KEY is not set (caller should fall back
-    to stub behaviour in that case).
+    If OPENAI_API_KEY is missing, return None.
+    Callers must handle the None-case (e.g., fall back to local models or stub mode).
+
+    Returns:
+        OpenAI | None
     """
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
@@ -24,32 +27,72 @@ def get_openai_client() -> Optional[OpenAI]:
 
 def get_model_name(default: str = "gpt-4.1-mini") -> str:
     """
-    Resolve Bob's model name from env, with a sensible default.
+    Resolve Bob's model name from the environment with a safe fallback.
+
+    Env:
+        BOB_MODEL - override model name
+
+    Args:
+        default: Model fallback if no env override is provided.
+
+    Returns:
+        Name of the model to use.
     """
     return os.getenv("BOB_MODEL", default)
 
 
-# Add configurations for jailed project base directory enforcement
-DEFAULT_PROJECT_BASE_DIR = '.'  # default base for jail enforcement
+# ---------------------------------------------------------------------------
+# Path Jail / Filesystem Safety
+# ---------------------------------------------------------------------------
 
-# Add configuration or flag to enable stricter path checks in planner and I/O
-ENABLE_STRICT_PATH_JAIL_ENFORCEMENT = True
+DEFAULT_PROJECT_BASE_DIR: str = "."
+"""
+Default location used when no explicit jail root is provided.
+Used by planner and I/O helpers to interpret relative paths.
+"""
+
+ENABLE_STRICT_PATH_JAIL_ENFORCEMENT: bool = True
+"""
+Global flag enabling jail boundary checks.
+If True, any path escaping the jail root should be rejected by Chad.
+"""
+
+JAIL_ROOT: str = "/app/project_root"
+"""
+Absolute base directory for the entire Bob/Chad project jail.
+
+All read/write operations should resolve paths relative to this root.
+Tools and helpers should ensure no traversal escapes this boundary.
+"""
 
 
-# Add configuration for jail root path if not already present
-# This can be used by planner, text_io, and notes modules to uniformly enforce jail
+# ---------------------------------------------------------------------------
+# File Handling Behaviour
+# ---------------------------------------------------------------------------
 
-JAIL_ROOT = '/app/project_root'  # Example path, adjust as per actual project environment
+ENABLE_FILE_EXISTENCE_PRECHECKS: bool = True
+"""
+If True, Chad's tools will explicitly check for file existence
+before operating on a target path. Helps prevent surprise errors.
+"""
+
+FILE_MISSING_BEHAVIOR: str = "raise"
+"""
+Policy for how tools handle missing target files.
+
+Options:
+    - 'raise' : Throw an error (strict, safest)
+    - 'warn'  : Log a warning and continue
+    - 'ignore': Silently continue
+"""
 
 
-# Adding config flag to enable robust file existence prechecks
-ENABLE_FILE_EXISTENCE_PRECHECKS = True
+# ---------------------------------------------------------------------------
+# Test / Import Controls
+# ---------------------------------------------------------------------------
 
-
-# Add configuration for test import retries or fallback if needed
-TEST_IMPORT_RETRY_LIMIT = 1  # can be increased later if needed
-
-
-# Add configuration to define behavior for missing target files
-FILE_MISSING_BEHAVIOR = 'raise'  # Options: 'raise', 'warn', 'ignore'
-
+TEST_IMPORT_RETRY_LIMIT: int = 1
+"""
+Number of times Chad may retry certain imports (e.g., dynamic tool modules)
+before giving up. Set higher if tests sometimes race-loading new modules.
+"""

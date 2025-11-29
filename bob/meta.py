@@ -4,8 +4,6 @@
 # - Added end-of-run summary logging.
 # These changes aim to prevent overwork and recursion while keeping existing safety checks intact.
 
-
-
 from __future__ import annotations
 
 """
@@ -56,10 +54,9 @@ def log_warning(message: str) -> None:
 path_safety_enhancements = {
     "description": "Additional path validation and absolute path jail enforcement added in planner and notes modules",
     "priority": "low",
-    "goal": "Prevent target path escapes from project jail without weakening fs_tools core safety",
+    "goal": "Prevent target path escapes from project jail without weakening core file safety",
     "status": "implemented",
 }
-
 
 # ---------------------------------------------------------------------
 # Paths / constants
@@ -79,7 +76,6 @@ SAFE_SELF_PATHS: Tuple[str, ...] = (
     "bob/planner.py",
     "bob/schema.py",
     "chad/notes.py",
-    "chad/text_io.py",
     "bob/meta.py",
 )
 
@@ -109,7 +105,7 @@ class Issue:
     """An aggregated failure pattern across many HistoryRecords."""
 
     key: str  # stable key for grouping (e.g. error slug)
-    area: str  # planner / executor / fs_tools / tests / other
+    area: str  # planner / executor / tests / other
     description: str  # human-readable description
     evidence_ids: List[int]  # line numbers or indices in history
     examples: List[str]  # short error snippets
@@ -126,7 +122,7 @@ class Ticket:
 
     id: str
     scope: str  # "self" or "ghostfrog" / etc.
-    area: str  # planner / executor / fs_tools / tests / other
+    area: str  # planner / executor / tests / other
     title: str
     description: str
     evidence: List[str]
@@ -141,9 +137,9 @@ class Ticket:
 # ---------------------------------------------------------------------
 
 def _append_ticket_history(
-    fingerprint: str,
-    status: str,
-    extra: Dict[str, Any] | None = None,
+        fingerprint: str,
+        status: str,
+        extra: Dict[str, Any] | None = None,
 ) -> None:
     """
     Append a single ticket outcome to a JSONL history file.
@@ -162,8 +158,8 @@ def _append_ticket_history(
 
 
 def _ticket_recently_completed(
-    fingerprint: str,
-    lookback_hours: int = 24,
+        fingerprint: str,
+        lookback_hours: int = 24,
 ) -> bool:
     """
     Return True if this ticket fingerprint has a 'completed' record
@@ -432,25 +428,25 @@ def _parse_history_line(line: str) -> Optional[HistoryRecord]:
         result=data.get("result") or "unknown",
         tests=data.get("tests"),
         error_summary=data.get("error_summary")
-        or data.get("error")
-        or data.get("traceback"),
+                      or data.get("error")
+                      or data.get("traceback"),
         human_fix_required=data.get("human_fix_required"),
         extra={
-            k: v
-            for k, v in data.items()
-            if k
-            not in {
-                "ts",
-                "target",
-                "result",
-                "tests",
-                "error_summary",
-                "error",
-                "traceback",
-                "human_fix_required",
-            }
-        }
-        or None,
+                  k: v
+                  for k, v in data.items()
+                  if k
+                     not in {
+                         "ts",
+                         "target",
+                         "result",
+                         "tests",
+                         "error_summary",
+                         "error",
+                         "traceback",
+                         "human_fix_required",
+                     }
+              }
+              or None,
     )
 
 
@@ -488,8 +484,6 @@ def _guess_area(rec: HistoryRecord) -> str:
     You can refine this over time.
     """
     err = (rec.error_summary or "").lower()
-    if "fs_tools" in err or "path" in err or "jail" in err:
-        return "fs_tools"
     if "planner" in err or "plan" in err:
         return "planner"
     if "pytest" in err or "test" in err or "assert" in err:
@@ -543,9 +537,9 @@ def _make_ticket_id(issue: Issue) -> str:
 
 
 def issues_to_tickets(
-    issues: Iterable[Issue],
-    scope: str = META_TARGET_SELF,
-    limit: int = 5,
+        issues: Iterable[Issue],
+        scope: str = META_TARGET_SELF,
+        limit: int = 5,
 ) -> List[Ticket]:
     tickets: List[Ticket] = []
     for issue in issues:
@@ -631,9 +625,12 @@ def build_self_improvement_prompt(ticket: Ticket) -> str:
           tests passing.
 
         Constraints:
-        - Do not relax or remove safety checks in fs_tools / jail boundaries.
+        - Do not relax or remove safety checks in jail boundaries.
+        - Do not create new modules or new Python files. Only edit existing files.
+        - Do not add monkey-patching layers, global hooks, or meta-frameworks.
         - Prefer editing prompts, planner heuristics, notes, and non-critical
           glue code rather than deep infrastructure changes.
+        - Keep diffs very small and targeted. No wide refactors.
         - Ensure pytest passes for this project when you are done.
         """
     ).strip()
@@ -959,7 +956,7 @@ def cmd_repair_then_retry(args: argparse.Namespace) -> None:
         else:
             nested = failed_real.extra.get("extra")
             if isinstance(nested, dict) and isinstance(
-                nested.get("tools_enabled"), bool
+                    nested.get("tools_enabled"), bool
             ):
                 tools_enabled = nested["tools_enabled"]
 
@@ -1496,7 +1493,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pnt.add_argument(
         "--area",
-        choices=["planner", "executor", "fs_tools", "tests", "other"],
+        choices=["planner", "executor", "tests", "other"],
         default="other",
         help="Rough area this ticket relates to.",
     )
@@ -1567,7 +1564,6 @@ def main(argv: Optional[List[str]] = None) -> None:
 if __name__ == "__main__":
     main()
 
-
 import os
 import tempfile
 import logging
@@ -1612,7 +1608,8 @@ def self_cycle(*args, **kwargs):
         for ticket in original_self_cycle(*args, **kwargs):
             ticket_count += 1
             if ticket_count > MAX_TICKETS_PER_RUN:
-                logger.warning(f'Max ticket count {MAX_TICKETS_PER_RUN} reached, stopping self_cycle to prevent overwork.')
+                logger.warning(
+                    f'Max ticket count {MAX_TICKETS_PER_RUN} reached, stopping self_cycle to prevent overwork.')
                 break
             yield ticket
 
@@ -1657,7 +1654,8 @@ def guarded_self_cycle(*args, **kwargs):
     breadcrumb = read_breadcrumb()
     count = breadcrumb.get('count', 0)
     if count >= MAX_TICKETS_PER_RUN:
-        logging.warning(f'self_cycle reached max ticket count limit ({MAX_TICKETS_PER_RUN}), stopping to avoid recursion or overwork.')
+        logging.warning(
+            f'self_cycle reached max ticket count limit ({MAX_TICKETS_PER_RUN}), stopping to avoid recursion or overwork.')
         return None
 
     breadcrumb['count'] = count + 1
@@ -1680,7 +1678,6 @@ def guarded_self_cycle(*args, **kwargs):
 if 'self_cycle' in globals():
     original_self_cycle = globals()['self_cycle']
     globals()['self_cycle'] = guarded_self_cycle
-
 
 import json
 import os
@@ -1719,7 +1716,6 @@ def parse_pytest_json_report(report_path='tests/report.json'):
     return summary
 
 
-
 # Add new subcommand 'queue_clean' to invoke the queue cleaner
 import argparse
 import logging
@@ -1743,6 +1739,7 @@ def subcmd_queue_clean(args):
 
 old_main = globals().get('main', None)
 
+
 def main_with_queue_clean():
     parser = argparse.ArgumentParser(description="Bob main meta tool")
     parser.add_argument('command', nargs='?', help='subcommand to run')
@@ -1759,4 +1756,3 @@ def main_with_queue_clean():
 
 if __name__ == '__main__':
     exit(main_with_queue_clean())
-

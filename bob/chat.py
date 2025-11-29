@@ -8,7 +8,10 @@ from .config import get_openai_client, get_model_name
 
 def bob_simple_chat(user_text: str) -> str:
     """
-    Simple Q&A mode for Bob when no file is involved.
+    Simple, stateless Q&A mode for Bob when no file or tools are involved.
+
+    This is used for "just chat" questions from the UI, where Bob should behave
+    like a normal assistant and not talk about plans, JSON, or tools.
     """
     client = get_openai_client()
     if client is None:
@@ -41,7 +44,17 @@ def bob_simple_chat(user_text: str) -> str:
 
 def bob_answer_with_context(user_text: str, plan: Dict, snippet: str) -> str:
     """
-    Bob answers about a specific file snippet (analysis mode).
+    Answer a user question about a specific file snippet (analysis mode).
+
+    Args:
+        user_text: The user's question or instruction.
+        plan: The plan dict Bob produced for this task (currently unused here,
+              but kept for future extensions / richer context).
+        snippet: Text snippet read from the target file by Chad.
+
+    Returns:
+        A natural-language explanation / review of the snippet, or a graceful
+        fallback message if the file could not be loaded or an error occurred.
     """
     client = get_openai_client()
     if client is None:

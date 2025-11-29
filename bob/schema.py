@@ -1,6 +1,14 @@
 # bob/schema.py
 from __future__ import annotations
 
+"""
+Schema definition for Bob's planning output.
+
+This JSON schema is used as a *contract* for the object Bob should emit when
+building a plan for Chad to execute. It is referenced in prompts and can also
+be used for validation on the Python side if desired.
+"""
+
 BOB_PLAN_SCHEMA = {
     "type": "object",
     "properties": {
@@ -8,17 +16,25 @@ BOB_PLAN_SCHEMA = {
             "type": "string",
             "enum": ["codemod", "analysis", "tool", "chat"],
         },
-        "summary": {"type": "string"},
+        "summary": {
+            "type": "string",
+            "description": "Short natural-language description of what Bob/Chad will do.",
+        },
         "analysis_file": {
             "type": "string",
             "default": "",
+            "description": "Relative path to a file to analyse (for 'analysis' tasks), or empty.",
         },
         "edits": {
             "type": "array",
+            "description": "List of codemod-style edits for Chad to apply.",
             "items": {
                 "type": "object",
                 "properties": {
-                    "file": {"type": "string"},
+                    "file": {
+                        "type": "string",
+                        "description": "Relative path to the target file inside the project jail.",
+                    },
                     "operation": {
                         "type": "string",
                         "enum": [
@@ -27,7 +43,10 @@ BOB_PLAN_SCHEMA = {
                             "append_to_bottom",
                         ],
                     },
-                    "content": {"type": "string"},
+                    "content": {
+                        "type": "string",
+                        "description": "Content payload for the chosen operation.",
+                    },
                 },
                 "required": ["file", "operation", "content"],
                 "additionalProperties": False,
@@ -35,6 +54,7 @@ BOB_PLAN_SCHEMA = {
         },
         "tool": {
             "type": "object",
+            "description": "Tool call description when task_type='tool'. Empty otherwise.",
             "properties": {
                 "name": {
                     "type": "string",
@@ -59,8 +79,3 @@ BOB_PLAN_SCHEMA = {
     "required": ["task_type", "summary", "analysis_file", "edits"],
     "additionalProperties": False,
 }
-
-
-# No changes needed here as schema relates to data models, not path safety.
-# However, a note or validator could be added in the future if needed.
-

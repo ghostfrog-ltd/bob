@@ -1,5 +1,5 @@
 # app.py
-#!/usr/bin/env python3
+# !/usr/bin/env python3
 # app.py – GhostFrog Bob ↔ Chad message bus + UI (PoC)
 
 from __future__ import annotations
@@ -40,6 +40,16 @@ import subprocess
 import sys
 import threading
 
+from helpers.text import (
+    slugify_for_markdown, 
+    safe_write_text, 
+    normalize_newlines, 
+    contains_suspicious_control_chars,
+    strip_suspicious_control_chars, 
+    detect_comment_prefix
+)
+
+from helpers.jail import resolve_in_project_jail
 
 # ---------------------------------------------------------------------------
 # Env + OpenAI client
@@ -194,11 +204,11 @@ def next_message_id() -> tuple[str, str, str]:
 
 
 def bob_build_plan(
-    id_str: str,
-    date_str: str,
-    base: str,
-    user_text: str,
-    tools_enabled: bool = True,
+        id_str: str,
+        date_str: str,
+        base: str,
+        user_text: str,
+        tools_enabled: bool = True,
 ) -> dict:
     """
     Bob builds a structured plan for Chad.
@@ -278,7 +288,7 @@ def bob_build_plan(
         first = raw.find("{")
         last = raw.rfind("}")
         if first != -1 and last != -1:
-            raw = raw[first : last + 1]
+            raw = raw[first: last + 1]
 
         body = json.loads(raw)
 
@@ -318,9 +328,9 @@ def bob_build_plan(
 
 
 def bob_refine_codemod_with_files(
-    user_text: str,
-    base_task: dict,
-    file_contexts: dict[str, str],
+        user_text: str,
+        base_task: dict,
+        file_contexts: dict[str, str],
 ) -> dict:
     """
     Second-pass planner for codemods: refine plan given real file contents.
@@ -366,7 +376,7 @@ def bob_refine_codemod_with_files(
         first = raw.find("{")
         last = raw.rfind("}")
         if first != -1 and last != -1:
-            raw = raw[first : last + 1]
+            raw = raw[first: last + 1]
 
         body = json.loads(raw)
 
@@ -458,89 +468,6 @@ def bob_answer_with_context(user_text: str, plan: dict, snippet: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _normalize_newlines(text: str) -> str:
-    return text.replace("\r\n", "\n").replace("\r", "\n")
-
-
-def _safe_read_text(target_path: str) -> str:
-    """
-    Safely read a file for diffing.
-
-    - If the file does not exist, return an empty string instead of raising.
-      This lets Chad treat it as a brand-new file.
-    - Always read as UTF-8 with replacement, so weird bytes don't crash us.
-    """
-    path = Path(target_path)
-
-    # New file: treat as empty original.
-    if not path.exists():
-        return ""
-
-    try:
-        with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
-            return f.read()
-    except FileNotFoundError:
-        # Race condition / just deleted: also treat as empty.
-        return ""
-
-
-def _contains_suspicious_control_chars(text: str) -> bool:
-    for ch in text:
-        if ord(ch) < 32 and ch not in ("\n", "\r", "\t"):
-            return True
-    return False
-
-
-def _strip_suspicious_control_chars(text: str) -> str:
-    return "".join(
-        ch
-        for ch in text
-        if not (ord(ch) < 32 and ch not in ("\n", "\r", "\t"))
-    )
-
-
-def _safe_write_text(path: Path, text: str) -> None:
-    if not isinstance(text, str):
-        text = str(text)
-    text = _normalize_newlines(text)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
-
-
-def _detect_comment_prefix(path: Path) -> str:
-    ext = path.suffix.lower()
-    if ext in {".py", ".sh"}:
-        return "# "
-    if ext in {".js", ".ts", ".jsx", ".tsx", ".c", ".cpp", ".h", ".php"}:
-        return "// "
-    return "# "
-
-
-def _resolve_in_project_jail(relative_path: str) -> Path | None:
-    if not relative_path:
-        relative_path = "."
-    target = (PROJECT_ROOT / relative_path).resolve()
-    try:
-        target.relative_to(PROJECT_ROOT)
-    except ValueError:
-        return None
-    return target
-
-
-def _slugify_for_markdown(title: str) -> str:
-    base = "".join(
-        ch.lower() if ch.isalnum() else "-"
-        for ch in (title or "").strip()
-    ).strip("-")
-    if not base:
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        return f"note-{timestamp}"
-    while "--" in base:
-        base = base.replace("--", "-")
-    return base
-
-
 def chad_execute_plan(id_str: str, date_str: str, base: str, plan: dict) -> dict:
     """
     Execute Bob's plan.
@@ -585,7 +512,7 @@ def chad_execute_plan(id_str: str, date_str: str, base: str, plan: dict) -> dict
             except (TypeError, ValueError):
                 max_entries = 200
 
-            base_path = _resolve_in_project_jail(rel_path)
+            base_path = resolve_in_project_jail(rel_path)
             if base_path is None or not base_path.exists():
                 message = (
                     f"Chad tried to list_files at {rel_path!r} but the path was invalid "
@@ -667,11 +594,11 @@ def chad_execute_plan(id_str: str, date_str: str, base: str, plan: dict) -> dict
             except (TypeError, ValueError):
                 max_chars = 16000
 
-            target_path = _resolve_in_project_jail(rel_path)
+            target_path = resolve_in_project_jail(rel_path)
             if (
-                target_path is None
-                or not target_path.exists()
-                or not target_path.is_file()
+                    target_path is None
+                    or not target_path.exists()
+                    or not target_path.is_file()
             ):
                 message = (
                     f"Chad tried to read_file {rel_path!r} but it does not exist, "
@@ -696,7 +623,7 @@ def chad_execute_plan(id_str: str, date_str: str, base: str, plan: dict) -> dict
         elif tool_name in {"create_markdown_note", "append_to_markdown_note"}:
             title = str(tool_args.get("title") or tool_args.get("name") or "").strip()
             content = str(tool_args.get("content") or "")
-            slug = _slugify_for_markdown(title or "note")
+            slug = slugify_for_markdown(title or "note")
             note_path = MARKDOWN_NOTES_DIR / f"{slug}.md"
 
             if tool_name == "create_markdown_note":
@@ -729,7 +656,7 @@ def chad_execute_plan(id_str: str, date_str: str, base: str, plan: dict) -> dict
         elif tool_name == "send_email":
             # FORCE TO ENV – ignore any 'to' passed in tool_args when env vars exist
             to_addr = (
-                os.getenv("SMTP_TO") or os.getenv("SMTP_TEST_TO") or ""
+                    os.getenv("SMTP_TO") or os.getenv("SMTP_TEST_TO") or ""
             ).strip()
 
             subject = str(tool_args.get("subject") or "").strip()
@@ -814,7 +741,7 @@ def chad_execute_plan(id_str: str, date_str: str, base: str, plan: dict) -> dict
 
                         for rel in attachments:
                             rel_str = str(rel)
-                            attach_path = _resolve_in_project_jail(rel_str)
+                            attach_path = resolve_in_project_jail(rel_str)
                             if attach_path is None or not attach_path.exists():
                                 continue
                             mime_type, _ = mimetypes.guess_type(str(attach_path))
@@ -885,12 +812,12 @@ def chad_execute_plan(id_str: str, date_str: str, base: str, plan: dict) -> dict
                 )
                 tool_result = ""
             else:
-                script_path = _resolve_in_project_jail(script_rel)
+                script_path = resolve_in_project_jail(script_rel)
 
                 if (
-                    script_path is None
-                    or not script_path.exists()
-                    or not script_path.is_file()
+                        script_path is None
+                        or not script_path.exists()
+                        or not script_path.is_file()
                 ):
                     message = (
                         f"Chad tried to run_python_script on {script_rel!r} but the "
@@ -1057,7 +984,7 @@ def chad_execute_plan(id_str: str, date_str: str, base: str, plan: dict) -> dict
                 # For these, we allow Bob to "grow" new files:
                 # create an empty file first, then apply the op below.
                 target_path.parent.mkdir(parents=True, exist_ok=True)
-                _safe_write_text(target_path, "")
+                safe_write_text(target_path, "")
                 exists = True
             else:
                 # For all other ops, missing files are still an error.
@@ -1088,9 +1015,9 @@ def chad_execute_plan(id_str: str, date_str: str, base: str, plan: dict) -> dict
         original = _safe_read_text(target_path)
 
         if op == "create_or_overwrite_file":
-            new_text = _normalize_newlines(content)
-            if _contains_suspicious_control_chars(new_text):
-                new_text = _strip_suspicious_control_chars(new_text)
+            new_text = normalize_newlines(content)
+            if contains_suspicious_control_chars(new_text):
+                new_text = strip_suspicious_control_chars(new_text)
                 edit_logs.append(
                     {
                         "file": file_rel,
@@ -1125,7 +1052,7 @@ def chad_execute_plan(id_str: str, date_str: str, base: str, plan: dict) -> dict
                         new_lines[i] = old_line
                 new_text = "\n".join(new_lines)
 
-            if _normalize_newlines(original) == new_text:
+            if normalize_newlines(original) == new_text:
                 edit_logs.append(
                     {
                         "file": file_rel,
@@ -1135,7 +1062,7 @@ def chad_execute_plan(id_str: str, date_str: str, base: str, plan: dict) -> dict
                 )
                 continue
 
-            _safe_write_text(target_path, new_text)
+            safe_write_text(target_path, new_text)
             touched.append(str(target_path.relative_to(PROJECT_ROOT)))
             edit_logs.append(
                 {
@@ -1147,9 +1074,9 @@ def chad_execute_plan(id_str: str, date_str: str, base: str, plan: dict) -> dict
 
         elif op == "append_to_bottom":
             new_text_raw = original.rstrip() + "\n\n" + content + "\n"
-            new_text = _normalize_newlines(new_text_raw)
-            if _contains_suspicious_control_chars(new_text):
-                new_text = _strip_suspicious_control_chars(new_text)
+            new_text = normalize_newlines(new_text_raw)
+            if contains_suspicious_control_chars(new_text):
+                new_text = strip_suspicious_control_chars(new_text)
                 edit_logs.append(
                     {
                         "file": file_rel,
@@ -1158,7 +1085,7 @@ def chad_execute_plan(id_str: str, date_str: str, base: str, plan: dict) -> dict
                     }
                 )
 
-            if _normalize_newlines(original) == new_text:
+            if normalize_newlines(original) == new_text:
                 edit_logs.append(
                     {
                         "file": file_rel,
@@ -1168,7 +1095,7 @@ def chad_execute_plan(id_str: str, date_str: str, base: str, plan: dict) -> dict
                 )
                 continue
 
-            _safe_write_text(target_path, new_text)
+            safe_write_text(target_path, new_text)
             touched.append(str(target_path.relative_to(PROJECT_ROOT)))
             edit_logs.append(
                 {
@@ -1182,22 +1109,22 @@ def chad_execute_plan(id_str: str, date_str: str, base: str, plan: dict) -> dict
             if target_path.suffix.lower() == ".py":
                 content_stripped = content.lstrip()
                 if content_stripped.startswith('"""') or content_stripped.startswith(
-                    "'''"
+                        "'''"
                 ):
                     lines = original.splitlines()
                     if lines and lines[0].startswith("#!"):
                         new_text_raw = (
-                            lines[0]
-                            + "\n\n"
-                            + content
-                            + "\n\n"
-                            + "\n".join(lines[1:])
+                                lines[0]
+                                + "\n\n"
+                                + content
+                                + "\n\n"
+                                + "\n".join(lines[1:])
                         )
                     else:
                         new_text_raw = content + "\n\n" + original
-                    new_text = _normalize_newlines(new_text_raw)
-                    if _contains_suspicious_control_chars(new_text):
-                        new_text = _strip_suspicious_control_chars(new_text)
+                    new_text = normalize_newlines(new_text_raw)
+                    if contains_suspicious_control_chars(new_text):
+                        new_text = strip_suspicious_control_chars(new_text)
                         edit_logs.append(
                             {
                                 "file": file_rel,
@@ -1206,7 +1133,7 @@ def chad_execute_plan(id_str: str, date_str: str, base: str, plan: dict) -> dict
                             }
                         )
 
-                    if _normalize_newlines(original) == new_text:
+                    if normalize_newlines(original) == new_text:
                         edit_logs.append(
                             {
                                 "file": file_rel,
@@ -1216,7 +1143,7 @@ def chad_execute_plan(id_str: str, date_str: str, base: str, plan: dict) -> dict
                         )
                         continue
 
-                    _safe_write_text(target_path, new_text)
+                    safe_write_text(target_path, new_text)
                     touched.append(str(target_path.relative_to(PROJECT_ROOT)))
                     edit_logs.append(
                         {
@@ -1227,11 +1154,11 @@ def chad_execute_plan(id_str: str, date_str: str, base: str, plan: dict) -> dict
                     )
                     continue
 
-            prefix = _detect_comment_prefix(target_path)
+            prefix = detect_comment_prefix(target_path)
             new_text_raw = f"{prefix}{content}\n\n{original}"
-            new_text = _normalize_newlines(new_text_raw)
-            if _contains_suspicious_control_chars(new_text):
-                new_text = _strip_suspicious_control_chars(new_text)
+            new_text = normalize_newlines(new_text_raw)
+            if contains_suspicious_control_chars(new_text):
+                new_text = strip_suspicious_control_chars(new_text)
                 edit_logs.append(
                     {
                         "file": file_rel,
@@ -1240,7 +1167,7 @@ def chad_execute_plan(id_str: str, date_str: str, base: str, plan: dict) -> dict
                     }
                 )
 
-            if _normalize_newlines(original) == new_text:
+            if normalize_newlines(original) == new_text:
                 edit_logs.append(
                     {
                         "file": file_rel,
@@ -1250,7 +1177,7 @@ def chad_execute_plan(id_str: str, date_str: str, base: str, plan: dict) -> dict
                 )
                 continue
 
-            _safe_write_text(target_path, new_text)
+            safe_write_text(target_path, new_text)
             touched.append(str(target_path.relative_to(PROJECT_ROOT)))
             edit_logs.append(
                 {
@@ -1348,7 +1275,7 @@ def api_chat():
     prefix = "#bob no-tools"
     if message.lower().startswith(prefix):
         tools_enabled = False
-        message = message[len(prefix) :].lstrip()
+        message = message[len(prefix):].lstrip()
 
     if not message:
         return jsonify(
@@ -1558,9 +1485,9 @@ def api_chat():
 
         # Base heuristic for failure
         if (
-            "failed" in msg_text
-            or "error" in msg_text
-            or "unknown tool" in msg_text
+                "failed" in msg_text
+                or "error" in msg_text
+                or "unknown tool" in msg_text
         ):
             result_label = "fail"
             error_summary = exec_report.get("message")
@@ -1630,7 +1557,6 @@ def api_chat():
 # Run tests before starting server
 # ---------------------------------------------------------------------------
 
-
 def run_tests_on_startup() -> bool:
     """
     Run pytest before starting the web app.
@@ -1657,33 +1583,3 @@ if __name__ == "__main__":
     if run_tests_on_startup():
         print("[Bob/Chad] Web UI starting on http://127.0.0.1:8765/chat")
         app.run(host="127.0.0.1", port=8765)
-
-
-from flask import request, jsonify
-
-# Add endpoint to fetch chat messages with paging
-@app.route('/chat/messages')
-def get_chat_messages():
-    # Assuming messages are stored in a list or DB, here we simulate with a function get_messages(offset, limit)
-    try:
-        offset = int(request.args.get('offset', 0))
-        limit = int(request.args.get('limit', 20))
-    except ValueError:
-        return jsonify({'error': 'Invalid offset or limit'}), 400
-
-    messages = get_messages(offset=offset, limit=limit)  # Implement or adjust get_messages accordingly
-    total_count = get_total_message_count()  # Implement or adjust this too
-
-    return jsonify({'messages': messages, 'offset': offset, 'limit': limit, 'total': total_count})
-
-
-# Stub implementations for this example (adjust if the project has a different data source)
-def get_messages(offset=0, limit=20):
-    # This should retrieve from actual chat history storage
-    # Here just simulate with sample data
-    all_messages = app.config.get('CHAT_HISTORY', [])
-    return all_messages[offset:offset+limit]
-
-def get_total_message_count():
-    return len(app.config.get('CHAT_HISTORY', []))
-
