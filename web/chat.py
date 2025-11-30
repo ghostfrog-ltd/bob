@@ -122,6 +122,9 @@ def create_chat_blueprint(
         edits = task.get("edits") or []
         tool_obj = task.get("tool") or {}
 
+        # <-- NEW: unify touched_files here so we can send it back to the UI
+        touched_files: List[str] = exec_report.get("touched_files") or []
+
         ui_messages: List[Dict[str, str]] = [
             {"role": "bob", "text": f"Bob: thinking… (id {base})"},
             {"role": "bob", "text": f"Bob: Plan → {summary}"},
@@ -215,7 +218,6 @@ def create_chat_blueprint(
         # CODEMOD
         # --------------------------------------------------
         else:
-            touched_files = exec_report.get("touched_files") or []
             ui_messages.append({"role": "chad", "text": "Chad: working on Bob's plan…"})
             ui_messages.append(
                 {
@@ -270,7 +272,6 @@ def create_chat_blueprint(
 
             msg_text = (exec_report.get("message") or "").lower()
             edits_requested = exec_report.get("edits_requested", len(edits))
-            touched_files = exec_report.get("touched_files") or []
             edit_logs = exec_report.get("edit_logs") or []
 
             # Base heuristic for failure
@@ -340,6 +341,13 @@ def create_chat_blueprint(
             # Never let logging break the chat flow
             pass
 
-        return jsonify({"messages": ui_messages})
+        # <-- IMPORTANT: include touched_files + task_type so the browser can decide to reload
+        return jsonify(
+            {
+                "messages": ui_messages,
+                "touched_files": touched_files,
+                "task_type": task_type,
+            }
+        )
 
     return bp
