@@ -15,7 +15,7 @@ UI: http://127.0.0.1:8765/chat
 """
 
 import os
-import smtplib  # keep this so tests can monkeypatch app.smtplib
+import smtplib
 import subprocess
 import sys
 import threading
@@ -25,7 +25,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from flask import Flask
 
-from bob.meta_log import log_history_record
+from meta.log import log_history_record
 from bob.schema import BOB_PLAN_SCHEMA  # noqa: F401  (exported for tests/introspection)
 from bob.planner import bob_build_plan, bob_refine_codemod_with_files
 from bob.chat import bob_simple_chat, bob_answer_with_context
@@ -70,14 +70,14 @@ else:
 
 def _auto_repair_then_retry_async() -> None:
     """
-    Fire-and-forget: run `python3 -m bob.meta repair_then_retry` in the
+    Fire-and-forget: run `python3 -m meta repair_then_retry` in the
     background so Bob/Chad can self-repair and retry the last failed job.
     """
 
     def _run() -> None:
         try:
             subprocess.run(
-                [sys.executable, "-m", "bob.meta", "repair_then_retry"],
+                [sys.executable, "-m", "meta", "repair_then_retry"],
                 cwd=str(AI_ROOT),
                 check=False,
             )

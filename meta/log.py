@@ -1,8 +1,7 @@
-# bob/meta_log.py
+# meta/log.py
 from __future__ import annotations
 
 import json
-import os
 import gzip
 import shutil
 from datetime import datetime, timedelta
@@ -10,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 # ---------------------------------------------------------------------------
-# Paths (mirrored from bob/meta.py)
+# Paths (mirrored from meta/core.py)
 # ---------------------------------------------------------------------------
 
 ROOT_DIR = Path(__file__).resolve().parents[1]  # .../ghostfrog-project-bob
@@ -52,14 +51,6 @@ def log_history_record(
 
     Each record is written as one JSON document per line and is suitable for
     later streaming / grep / off-line analysis.
-
-    Args:
-        target: Logical target of the run, e.g. "gf_aab", "self", "other_project".
-        result: High-level outcome, e.g. "success", "fail", "partial".
-        tests: Test outcome summary, e.g. "pass", "fail", "not_run".
-        error_summary: Short description of any error encountered (if any).
-        human_fix_required: Whether human intervention is likely needed.
-        extra: Optional dict of additional structured fields to merge in.
     """
     _ensure_dirs()
 
@@ -88,11 +79,6 @@ def log_history_record(
 def _rotate_history_if_needed() -> None:
     """
     Rotate history.jsonl when it grows beyond MAX_HISTORY_RECORDS.
-
-    Rotation strategy:
-      - Count lines in HISTORY_FILE.
-      - If above threshold, rename to a timestamped archive and gzip it.
-      - Create a new empty HISTORY_FILE.
     """
     if not HISTORY_FILE.exists():
         return
@@ -101,7 +87,6 @@ def _rotate_history_if_needed() -> None:
         with HISTORY_FILE.open("r", encoding="utf-8") as f:
             line_count = sum(1 for _ in f)
     except OSError:
-        # If we can't read for some reason, skip rotation rather than crash.
         return
 
     if line_count < MAX_HISTORY_RECORDS:
@@ -113,10 +98,9 @@ def _rotate_history_if_needed() -> None:
     try:
         HISTORY_FILE.rename(archive_path)
     except OSError:
-        # If rename fails, don't block logging.
         return
 
-    # Create a fresh empty history file
+    # New empty history file
     HISTORY_FILE.touch()
 
     # Compress archive to .gz and remove original
@@ -136,9 +120,6 @@ def vacuum(log_dir: Optional[str | Path] = None) -> None:
 
     Removes *.gz files older than HISTORY_RETENTION_DAYS from the given
     directory (defaults to META_DIR).
-
-    Args:
-        log_dir: Directory containing compressed history archives.
     """
     base_dir = Path(log_dir) if log_dir is not None else META_DIR
     if not base_dir.exists():
@@ -177,4 +158,4 @@ if __name__ == "__main__":
         vacuum(dir_arg)
         print(f"Vacuumed old history archives in {dir_arg or META_DIR}")
     else:
-        print("Usage: meta_log.py vacuum [log_dir]")
+        print("Usage: log.py vacuum [log_dir]")

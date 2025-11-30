@@ -1,4 +1,3 @@
-# chad/tools/send_email_tool.py
 from __future__ import annotations
 
 import mimetypes
@@ -6,12 +5,13 @@ import os
 import smtplib
 from email.message import EmailMessage
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
+
+from dotenv import load_dotenv
+load_dotenv()
 
 from helpers.jail import resolve_in_project_jail
-
 from . import register_tool, ToolResult
-
 
 def _run_send_email(
     args: Dict[str, Any],
@@ -19,6 +19,28 @@ def _run_send_email(
     notes_dir: Path,
     scratch_dir: Path,  # unused
 ) -> ToolResult:
+    """
+    Chad tool: send_email
+
+    Uses env vars:
+
+      SMTP_HOST           – required
+      SMTP_PORT           – optional (default 587 or 465 for ssl)
+      SMTP_SECURITY       – 'starttls' (default) or 'ssl' or 'plain'
+      SMTP_USERNAME/USER  – optional (for authenticated SMTP)
+      SMTP_PASSWORD/PASS  – optional
+      SMTP_FROM           – required (or falls back to username)
+      SMTP_TO / SMTP_TEST_TO – required (at least one)
+
+    Attachments:
+      - args['attachments'] is a list of paths relative to project_root
+      - If no attachments are provided at all, the most recent note in data/notes
+        will be auto-attached.
+    """
+
+    # ------------------------------------------------------------------
+    # Addresses + basic args
+    # ------------------------------------------------------------------
     env_to = (
         os.getenv("SMTP_TO")
         or os.getenv("SMTP_TEST_TO")
@@ -64,16 +86,22 @@ def _run_send_email(
             if not subject:
                 subject = f"[GhostFrog] {latest.name}"
 
+    # ------------------------------------------------------------------
+    # SMTP config
+    # ------------------------------------------------------------------
     smtp_host = os.getenv("SMTP_HOST")
     security = (os.getenv("SMTP_SECURITY") or "starttls").lower()
+
     port_env = os.getenv("SMTP_PORT")
     if port_env:
         smtp_port = int(port_env)
     else:
         smtp_port = 465 if security == "ssl" else 587
 
-    smtp_user = os.getenv("SMTP_USERNAME")
-    smtp_password = os.getenv("SMTP_PASSWORD")
+    # Support both USER/USERNAME and PASS/PASSWORD
+    smtp_user = os.getenv("SMTP_USERNAME") or os.getenv("SMTP_USER")
+    smtp_password = os.getenv("SMTP_PASSWORD") or os.getenv("SMTP_PASS")
+
     from_addr = os.getenv("SMTP_FROM") or smtp_user
 
     if not to_addr:
@@ -81,14 +109,20 @@ def _run_send_email(
             "Chad was asked to send_email, but no SMTP_TO / SMTP_TEST_TO "
             "address is configured in the environment."
         )
+        # tests don't assert on tool_result here, but keep it empty
         return "", message
+
     if not smtp_host or not from_addr:
         message = (
             "Chad was asked to send_email, but SMTP settings are incomplete "
-            "(need at least SMTP_HOST and SMTP_FROM or SMTP_USERNAME)."
+            "(need at least SMTP_HOST and SMTP_FROM or SMTP_USER/SMTP_USERNAME)."
         )
+        # tests expect message to contain this and tool_result to be falsy
         return "", message
 
+    # ------------------------------------------------------------------
+    # Send email
+    # ------------------------------------------------------------------
     try:
         if security == "ssl":
             smtp_cls = smtplib.SMTP_SSL
@@ -97,16 +131,18 @@ def _run_send_email(
 
         with smtp_cls(smtp_host, smtp_port, timeout=30) as server:
             if security == "starttls":
+                # Keep this simple so tests' FakeSMTP/_DummySMTP work
                 server.starttls()
             if smtp_user and smtp_password:
                 server.login(smtp_user, smtp_password)
 
             msg = EmailMessage()
             msg["From"] = from_addr
-            msg["To"] = to_addr
+            msg["To"] = to_addr  # ignore args["to"], always force env
             msg["Subject"] = subject or "(no subject)"
             msg.set_content(body or "")
 
+            # Attach any files if requested / auto-note attached
             for rel in attachments:
                 rel_str = str(rel)
                 attach_path = resolve_in_project_jail(rel_str, project_root)
@@ -128,6 +164,9 @@ def _run_send_email(
 
             server.send_message(msg)
 
+        # ------------------------------------------------------------------
+        # Tool result text
+        # ------------------------------------------------------------------
         if auto_note and note_path is not None:
             try:
                 raw = note_path.read_text(encoding="utf-8")
@@ -154,7 +193,9 @@ def _run_send_email(
             f"Chad sent an email to {to_addr!r} with subject {subject!r}."
         )
         return tool_result, message
+
     except Exception as e:  # noqa: BLE001
+        # For errors, tests only care that message is set; tool_result can be empty
         message = f"Chad failed to send_email due to error: {e!r}"
         return "", message
 

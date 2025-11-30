@@ -85,6 +85,14 @@
     .message-row.user {
       justify-content: flex-end;
     }
+
+    .message-row.user > div:first-of-type{
+width: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    }
+
     .avatar {
       width: 28px;
       height: 28px;
@@ -104,6 +112,9 @@
       background: #064e3b;
       color: #a7f3d0;
     }
+
+    .avatar.bot + div {width: 100%;}
+
     .bubble {
       max-width: 70%;
       padding: 10px 12px;
@@ -248,11 +259,7 @@
       <div class="message-row bot">
         <div class="avatar bot">B</div>
         <div>
-          <div class="bubble bot">
-            Hey, I'm <strong>Bob</strong>, your cloud reasoner.<br/>
-            I talk to <strong>Chad</strong> (local coder) via files in <code>/ai/data/queue</code>.<br/>
-            Type something and I'll plan it, Chad will "execute", and we'll both leave messages.
-          </div>
+          <div class="bubble bot">Welcome..</div>
           <div class="message-meta">Bob · ready</div>
         </div>
       </div>

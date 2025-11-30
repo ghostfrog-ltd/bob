@@ -4,7 +4,8 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
+
 from helpers.prompts import get_prompt
 from helpers.tools_prompt import describe_tools_for_prompt
 from .config import get_openai_client, get_model_name
@@ -16,7 +17,7 @@ def bob_build_plan(
     date_str: str,
     base: str,
     user_text: str,
-    queue_dir: Path,
+    queue_dir: Optional[Path] = None,
     *,
     tools_enabled: bool = True,
 ) -> Dict[str, Any]:
@@ -28,6 +29,10 @@ def bob_build_plan(
         - 'tool'     → call a specific local tool via Chad
         - 'analysis' → review/explain an existing file (no edits)
         - 'codemod'  → Chad may edit files
+
+    NOTE:
+        - queue_dir is optional; if provided, we will also write
+          `{base}.plan.json` into that directory for debugging/inspection.
     """
     now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     client = get_openai_client()
@@ -51,9 +56,10 @@ def bob_build_plan(
                 "tool": {},
             },
         }
-        (queue_dir / f"{base}.plan.json").write_text(
-            json.dumps(plan, indent=2), encoding="utf-8"
-        )
+        if queue_dir is not None:
+            (queue_dir / f"{base}.plan.json").write_text(
+                json.dumps(plan, indent=2), encoding="utf-8"
+            )
         return plan
 
     # ------------------------------------------------------------------
@@ -134,9 +140,11 @@ def bob_build_plan(
         },
     }
 
-    (queue_dir / f"{base}.plan.json").write_text(
-        json.dumps(plan, indent=2), encoding="utf-8"
-    )
+    if queue_dir is not None:
+        (queue_dir / f"{base}.plan.json").write_text(
+            json.dumps(plan, indent=2), encoding="utf-8"
+        )
+
     return plan
 
 
