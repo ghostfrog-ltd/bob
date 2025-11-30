@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -18,7 +19,7 @@ from chad.tools import run_tool as run_chad_tool
 
 
 # ---------------------------------------------------------------------------
-# Main entrypoint – used by tests and by app.py
+# Main entrypoint – used by app.py (and can be used by tests)
 # ---------------------------------------------------------------------------
 
 def chad_execute_plan(
@@ -36,10 +37,9 @@ def chad_execute_plan(
     Chad executes Bob's plan.
 
     Rules:
-      - Only acts on task.type == 'codemod' for file edits.
-      - For 'tool', runs a local tool (e.g. system datetime, list_files, SMTP).
-      - For 'analysis', reads a file for Bob to review.
-      - Only edits files INSIDE project_root.
+      - For task.type == 'tool'  → runs a local tool via chad.tools.
+      - For task.type == 'analysis' → reads a file snippet for Bob.
+      - For task.type == 'codemod'  → applies edits INSIDE project_root.
       - Returns a dict exec_report; NEVER returns None.
     """
     scratch_dir.mkdir(parents=True, exist_ok=True)
@@ -108,17 +108,17 @@ def chad_execute_plan(
             "analysis_file": None,
             "analysis_snippet": "",
             "tool_name": tool_name,
-            # IMPORTANT for tests: expose args & result
+            # useful for debugging / tests
             "tool_args": tool_args,
             "tool_result": tool_result,
             "message": message,
         }
         exec_path = queue_dir / f"{base}.exec.json"
-        exec_path.write_text(str(exec_report), encoding="utf-8")
+        exec_path.write_text(json.dumps(exec_report, indent=2), encoding="utf-8")
         return exec_report
 
     # ------------------------------------------------------------------
-    # ANALYSIS branch – minimal implementation (tests focus on tools)
+    # ANALYSIS branch
     # ------------------------------------------------------------------
     if task_type != "codemod":
         analysis_file = task.get("analysis_file") or ""
@@ -133,7 +133,10 @@ def chad_execute_plan(
                 target_path = None
 
             if target_path is not None and target_path.exists():
-                raw = target_path.read_text(encoding="utf-8")
+                try:
+                    raw = target_path.read_text(encoding="utf-8")
+                except Exception:
+                    raw = ""
                 analysis_snippet = raw[:16000]
                 target_rel = str(target_path.relative_to(project_root))
 
@@ -163,11 +166,11 @@ def chad_execute_plan(
             ),
         }
         exec_path = queue_dir / f"{base}.exec.json"
-        exec_path.write_text(str(exec_report), encoding="utf-8")
+        exec_path.write_text(json.dumps(exec_report, indent=2), encoding="utf-8")
         return exec_report
 
     # ------------------------------------------------------------------
-    # CODEMOD branch – stubbed enough for now (tests are about tools)
+    # CODEMOD branch
     # ------------------------------------------------------------------
     edit_logs: list[dict] = []
 
@@ -358,7 +361,7 @@ def chad_execute_plan(
         "Touched files:\n"
         + ("\n".join(touched) if touched else "(none)")
         + "\n\nEdit logs:\n"
-        + (str(edit_logs) if edit_logs else "(none)")
+        + (json.dumps(edit_logs, indent=2) if edit_logs else "(none)")
         + "\n",
         encoding="utf-8",
     )
@@ -388,5 +391,5 @@ def chad_execute_plan(
     }
 
     exec_path = queue_dir / f"{base}.exec.json"
-    exec_path.write_text(str(exec_report), encoding="utf-8")
+    exec_path.write_text(json.dumps(exec_report, indent=2), encoding="utf-8")
     return exec_report
