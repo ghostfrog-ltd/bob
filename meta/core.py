@@ -28,14 +28,13 @@ from typing import Iterable, List, Dict, Any, Tuple, Optional
 # NOTE: meta_log intentionally stays inside bob/
 from .log import log_history_record
 
-
 logger = logging.getLogger("meta")
 
 # ---------------------------------------------------------------------
 # Paths / constants
 # ---------------------------------------------------------------------
 
-ROOT_DIR = Path(__file__).resolve().parents[1]       # project root
+ROOT_DIR = Path(__file__).resolve().parents[1]  # project root
 DATA_DIR = ROOT_DIR / "data"
 META_DIR = DATA_DIR / "meta"
 HISTORY_FILE = META_DIR / "history.jsonl"
@@ -91,6 +90,7 @@ class Ticket:
     created_at: str
     safe_paths: List[str]
     raw_issue_key: str
+    kind: str = "self_improvement"  # NEW, default for old tickets
 
 
 # ---------------------------------------------------------------------
@@ -213,8 +213,10 @@ def _restore_files(snapshot: Dict[str, Optional[str]]) -> None:
         p = ROOT_DIR / rel
         if content is None:
             if p.exists() and p.is_file():
-                try: p.unlink()
-                except Exception: pass
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
             continue
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -228,6 +230,28 @@ def _restore_files(snapshot: Dict[str, Optional[str]]) -> None:
 # ---------------------------------------------------------------------
 
 def run_ticket_with_tests(ticket: Ticket, max_attempts: int = 2) -> Dict[str, Any]:
+    # ACTION tickets: no snapshots, no pytest, just run tools once
+    if getattr(ticket, "kind", "self_improvement") == "action":
+        prompt = build_action_prompt(ticket)
+        result = run_self_improvement_prompt(prompt, ticket)
+
+        attempts = [
+            {
+                "attempt": 1,
+                "result_label": result.get("result_label"),
+                "error_summary": result.get("error_summary"),
+                "tests_ok": True,
+                "pytest_output": "",
+                "exec_message": (result.get("exec_report") or {}).get("message"),
+            }
+        ]
+        return {
+            "success": True,  # if Bob/Chad ran, we treat as success here
+            "attempts": attempts,
+            "last_error": None,
+        }
+
+    # -------- existing self_improvement logic below --------
     attempts = []
     success = False
     last_error = None
@@ -265,6 +289,7 @@ def run_ticket_with_tests(ticket: Ticket, max_attempts: int = 2) -> Dict[str, An
                 "error_summary": result.get("error_summary"),
                 "tests_ok": tests_ok,
                 "pytest_output": pytest_out,
+                "exec_message": (result.get("exec_report") or {}).get("message"),
             }
         )
 
@@ -304,19 +329,19 @@ def load_history(limit: int = 200) -> List[HistoryRecord]:
                 error_summary=data.get("error_summary"),
                 human_fix_required=data.get("human_fix_required"),
                 extra={
-                    k: v
-                    for k, v in data.items()
-                    if k
-                    not in {
-                        "ts",
-                        "target",
-                        "result",
-                        "tests",
-                        "error_summary",
-                        "human_fix_required",
-                    }
-                }
-                or None,
+                          k: v
+                          for k, v in data.items()
+                          if k
+                             not in {
+                                 "ts",
+                                 "target",
+                                 "result",
+                                 "tests",
+                                 "error_summary",
+                                 "human_fix_required",
+                             }
+                      }
+                      or None,
             )
         )
     return out
@@ -446,6 +471,35 @@ def save_ticket(ticket: Ticket) -> Path:
 # Self-improvement prompt
 # ---------------------------------------------------------------------
 
+def build_action_prompt(ticket: Ticket) -> str:
+    """
+    Prompt for ACTION tickets – do what the ticket says using tools,
+    do NOT edit files or run pytest.
+    """
+    return textwrap.dedent(
+        f"""
+        You are Bob running in ACTION mode.
+
+        Your job is to CARRY OUT the requested actions from this ticket
+        using the available tools (for example: send_email, run_python_script)
+        rather than editing code or changing project files.
+
+        Title: {ticket.title}
+        Area: {ticket.area}
+        Priority: {ticket.priority}
+
+        Requested action / description:
+        {ticket.description}
+
+        Guidelines:
+        - Prefer using the send_email tool when the ticket requests an email.
+        - Do NOT call run_python_script with an empty or invalid path.
+        - Do NOT create or edit any files.
+        - Do NOT weaken or change any safety/jail behaviour.
+        - At the end, summarise exactly what you did (e.g. which tools you called).
+        """
+    ).strip()
+
 def build_self_improvement_prompt(ticket: Ticket) -> str:
     return textwrap.dedent(
         f"""
@@ -569,6 +623,63 @@ def enqueue_self_improvement(ticket: Ticket) -> Path:
     return path
 
 
+def _update_ticket_file_status(
+        ticket: Ticket,
+        *,
+        status: Optional[str] = None,
+        last_result: Optional[str] = None,
+        last_error: Optional[str] = None,
+        last_exec_message: Optional[str] = None,
+) -> None:
+    """
+    Update the JSON ticket file with status / last_run info so the web UI
+    can reflect what happened.
+
+    We match on either 'id' or 'ticket_id' in the JSON.
+    """
+    if not TICKETS_DIR.exists():
+        return
+
+    now = datetime.now(tz=timezone.utc).isoformat()
+
+    for path in TICKETS_DIR.glob("*.json"):
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        id_match = raw.get("id") == ticket.id
+        tid_match = raw.get("ticket_id") == getattr(ticket, "id", None) or raw.get("ticket_id") == getattr(ticket,
+                                                                                                           "raw_issue_key",
+                                                                                                           None)
+
+        if not (id_match or tid_match):
+            # also allow matching on ticket_id if present
+            if raw.get("ticket_id") == getattr(ticket, "id", None):
+                pass
+            else:
+                continue
+
+        if status is not None:
+            raw["status"] = status
+
+        raw["last_run_at"] = now
+        if last_result is not None:
+            raw["last_result"] = last_result
+        if last_error is not None:
+            raw["last_error"] = last_error[:500]
+        if last_exec_message is not None:
+            raw["last_exec_message"] = last_exec_message[:500]
+
+        try:
+            path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+        # we assume only one match
+        break
+
+
 def _load_ticket_from_path(path: Path) -> Ticket:
     raw = json.loads(path.read_text(encoding="utf-8"))
     valid = {f.name for f in dataclass_fields(Ticket)}
@@ -576,9 +687,94 @@ def _load_ticket_from_path(path: Path) -> Ticket:
     return Ticket(**filtered)
 
 
+def _load_ticket_by_id(ticket_id: str) -> Optional[Ticket]:
+    """
+    Load a Ticket by its id or ticket_id.
+
+    - First try TICKETS_DIR/<ticket_id>.json
+    - Then scan all tickets and match on 'id' or 'ticket_id'
+    """
+    # direct file match
+    candidate = TICKETS_DIR / f"{ticket_id}.json"
+    if candidate.exists():
+        try:
+            return _load_ticket_from_path(candidate)
+        except Exception:
+            pass
+
+    # fallback: scan and match id / ticket_id fields
+    if not TICKETS_DIR.exists():
+        return None
+
+    for path in TICKETS_DIR.glob("*.json"):
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        if raw.get("id") == ticket_id or raw.get("ticket_id") == ticket_id:
+            valid = {f.name for f in dataclass_fields(Ticket)}
+            filtered = {k: v for k, v in raw.items() if k in valid}
+            return Ticket(**filtered)
+
+    return None
+
+
 # ---------------------------------------------------------------------
 # CLI Commands
 # ---------------------------------------------------------------------
+
+def cmd_run_ticket(args: argparse.Namespace) -> None:
+    """
+    Run a single ticket (by --id or --file) through the full
+    snapshot -> Bob/Chad -> pytest -> mark completed/failed flow.
+    """
+    ticket: Optional[Ticket] = None
+
+    if getattr(args, "file", None):
+        path = Path(args.file)
+        if not path.exists():
+            print(f"[run_ticket] File not found: {path}")
+            return
+        ticket = _load_ticket_from_path(path)
+    elif getattr(args, "id", None):
+        ticket = _load_ticket_by_id(args.id)
+        if ticket is None:
+            print(f"[run_ticket] No ticket found for id/ticket_id={args.id}")
+            return
+    else:
+        print("[run_ticket] Require --id or --file")
+        return
+
+    print(f"[run_ticket] Running ticket {ticket.id} [{ticket.priority}]...")
+
+    summary = run_ticket_with_tests(ticket, max_attempts=args.retries)
+    label = "OK" if summary["success"] else "FAILED"
+    print(f" → {label}")
+
+    # grab the last attempt's exec_message, if any
+    last_attempt = (summary.get("attempts") or [])[-1] if summary.get("attempts") else {}
+    exec_msg = last_attempt.get("exec_message")
+
+    if summary["success"]:
+        mark_ticket_completed(ticket)
+        _update_ticket_file_status(
+            ticket,
+            status="done",
+            last_result="OK",
+            last_exec_message=exec_msg,
+        )
+    else:
+        err = summary.get("last_error") or "pytest failed"
+        mark_ticket_failed(ticket, err)
+        _update_ticket_file_status(
+            ticket,
+            status="open",
+            last_result="FAILED",
+            last_error=err,
+            last_exec_message=exec_msg,
+        )
+
 
 def cmd_analyse(args: argparse.Namespace) -> None:
     hist = load_history(limit=args.limit)
@@ -814,6 +1010,12 @@ def build_parser() -> argparse.ArgumentParser:
     prq.add_argument("--retries", type=int, default=2)
     prq.add_argument("--keep-failed", action="store_true")
     prq.set_defaults(func=cmd_run_queue)
+
+    prt = sub.add_parser("run_ticket")
+    prt.add_argument("--id", help="Ticket id or ticket_id to run")
+    prt.add_argument("--file", help="Explicit ticket JSON path")
+    prt.add_argument("--retries", type=int, default=2)
+    prt.set_defaults(func=cmd_run_ticket)
 
     return p
 

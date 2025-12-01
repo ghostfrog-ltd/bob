@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>{{ ticket.ticket_id }} – {{ ticket.title }}</title>
+    <style>
+        body { font-family: system-ui, sans-serif; margin: 2rem; background: #050810; color: #e5e7eb; }
+        a { color: #38bdf8; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 999px; font-size: 0.7rem; background: #111827; border: 1px solid #1f2937; margin-right: 0.25rem; }
+        h1 { margin-bottom: 0.25rem; }
+        h2 { margin-top: 1.5rem; }
+        ul { padding-left: 1.25rem; }
+        code { background: #111827; padding: 0.1rem 0.25rem; border-radius: 0.25rem; }
+    </style>
+</head>
+<body>
+<p><a href="{{ url_for('meta.meta_index') }}">← Back to tickets</a></p>
+
+<h1>{{ ticket.title }}</h1>
+<div>
+    <span class="badge">ID: {{ ticket.ticket_id }}</span>
+    {% if ticket.priority %}<span class="badge">priority: {{ ticket.priority }}</span>{% endif %}
+    {% if ticket.component %}<span class="badge">component: {{ ticket.component }}</span>{% endif %}
+    {% if ticket.kind %}<span class="badge">kind: {{ ticket.kind }}</span>{% endif %}
+</div>
+
+{% if ticket.last_run_at %}
+  <p class="ticket-meta">
+    Last run: {{ ticket.last_run_at }}
+    {% if ticket.last_result %} ({{ ticket.last_result }}){% endif %}
+  </p>
+{% endif %}
+
+{% if ticket.last_exec_message %}
+  <h2>Last Run Output</h2>
+  <pre style="background:#020617;border-radius:0.5rem;padding:0.75rem;
+              border:1px solid #1f2937;white-space:pre-wrap;">
+{{ ticket.last_exec_message }}
+  </pre>
+{% endif %}
+
+{% if ticket.last_error %}
+  <h2>Last Error (pytest)</h2>
+  <pre style="background:#020617;border-radius:0.5rem;padding:0.75rem;
+              border:1px solid #1f2937;white-space:pre-wrap;">
+{{ ticket.last_error }}
+  </pre>
+{% endif %}
+
+{% if ticket.status == 'done' %}
+<div style="margin-top:1rem; display:flex; gap:0.5rem; align-items:center;">
+    <div style="padding:0.4rem 0.8rem;
+                background:#14532d;border:1px solid #166534;
+                border-radius:0.4rem;">
+        ✔ This ticket is completed
+    </div>
+    <form action="{{ url_for('meta.reopen_ticket', ticket_id=ticket.ticket_id) }}"
+          method="post">
+        <button type="submit"
+                style="background:#111827;color:#e5e7eb;padding:0.4rem 0.8rem;
+               border-radius:0.4rem;border:1px solid #4b5563;cursor:pointer;">
+            ↩ Reopen Ticket
+        </button>
+    </form>
+</div>
+{% else %}
+<div style="margin-top:1rem; display:flex; gap:0.5rem; align-items:center;">
+    <form action="{{ url_for('meta.run_ticket', ticket_id=ticket.ticket_id) }}"
+          method="post">
+        <button type="submit"
+                style="background:#2563eb;color:#fff;padding:0.4rem 0.8rem;
+               border-radius:0.4rem;border:1px solid #1d4ed8;cursor:pointer;">
+            ▶ Run Ticket with Bob/Chad
+        </button>
+    </form>
+
+    <form action="{{ url_for('meta.mark_ticket_complete', ticket_id=ticket.ticket_id) }}"
+          method="post">
+        <button type="submit"
+                style="background:#14532d;color:#fff;padding:0.4rem 0.8rem;
+               border-radius:0.4rem;border:1px solid #166534;cursor:pointer;">
+            ✔ Mark as Completed
+        </button>
+    </form>
+</div>
+{% endif %}
+
+
+{% if ticket.summary %}
+<h2>Summary</h2>
+<p>{{ ticket.summary }}</p>
+{% endif %}
+
+{% if ticket.acceptance_criteria %}
+<h2>Acceptance Criteria</h2>
+<ul>
+    {% for item in ticket.acceptance_criteria %}
+    <li>{{ item }}</li>
+    {% endfor %}
+</ul>
+{% endif %}
+
+{% if ticket.suggested_steps %}
+<h2>Suggested Steps</h2>
+<ol>
+    {% for step in ticket.suggested_steps %}
+    <li>{{ step }}</li>
+    {% endfor %}
+</ol>
+{% endif %}
+
+{% if ticket.raw %}
+<h2>Raw</h2>
+<pre>{{ ticket | tojson(indent=2) }}</pre>
+{% endif %}
+</body>
+</html>

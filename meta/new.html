@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>New Meta Ticket</title>
+    <style>
+        body { font-family: system-ui, sans-serif; margin: 2rem; background: #050810; color: #e5e7eb; }
+        a { color: #38bdf8; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        label { display:block; margin-top:1rem; font-weight:500; }
+        input[type="text"], textarea, select {
+          width:100%;
+          box-sizing:border-box;
+          padding:0.4rem 0.5rem;
+          margin-top:0.2rem;
+          background:#020617;
+          border:1px solid #1f2937;
+          border-radius:0.4rem;
+          color:#e5e7eb;
+          font-family:inherit;
+          font-size:0.9rem;
+        }
+        textarea { min-height:6rem; }
+        .actions { margin-top:1.5rem; display:flex; gap:0.75rem; align-items:center; }
+        button {
+          background:#2563eb;
+          border:1px solid #1d4ed8;
+          color:#fff;
+          padding:0.5rem 1rem;
+          border-radius:0.5rem;
+          cursor:pointer;
+          font-weight:500;
+        }
+        .error {
+          margin-bottom:1rem;
+          padding:0.5rem 0.75rem;
+          background:#450a0a;
+          border:1px solid #7f1d1d;
+          border-radius:0.4rem;
+          color:#fecaca;
+          font-size:0.9rem;
+        }
+        .hint { font-size:0.8rem; color:#9ca3af; margin-top:0.2rem; }
+    </style>
+</head>
+<body>
+<p><a href="{{ url_for('meta.meta_index') }}">← Back to tickets</a></p>
+
+<h1>Create New Meta Ticket</h1>
+
+{% if error %}
+<div class="error">{{ error }}</div>
+{% endif %}
+
+<form method="post">
+    <label>
+        Title
+        <input type="text" name="title" required
+               value="{{ (form.title or '') if form else '' }}">
+    </label>
+
+    <label>
+        Component
+        <input type="text" name="component"
+               placeholder="e.g. planner, executor, ui/chat"
+               value="{{ (form.component or '') if form else '' }}">
+        <div class="hint">Rough area of the codebase this affects.</div>
+    </label>
+
+    <label>
+        Priority
+        <select name="priority">
+            {% set current_prio = (form.priority or 'medium') if form else 'medium' %}
+            <option value="low" {% if current_prio==
+            'low' %}selected{% endif %}>Low</option>
+            <option value="medium" {% if current_prio==
+            'medium' %}selected{% endif %}>Medium</option>
+            <option value="high" {% if current_prio==
+            'high' %}selected{% endif %}>High</option>
+        </select>
+    </label>
+
+    <label>
+        Kind
+        <select name="kind">
+
+            {% set current_kind = (form.kind or 'self_improvement') if form else 'self_improvement' %}
+            <option value="self_improvement"
+                    {% if current_kind=='self_improvement' %}selected{% endif %}>
+                Self improvement (Bob/Chad fix themselves)
+            </option>
+            <option value="action"
+                    {% if current_kind=='action' %}selected{% endif %}>
+                Action (do the thing using tools)
+            </option>
+        </select>
+        <div class="hint">
+            Self improvement = change code & run pytest.
+            Action = use tools (e.g. send_email), no code edits.
+        </div>
+    </label>
+
+
+    <label>
+        Summary
+        <textarea name="summary"
+                  placeholder="Short description of what this ticket is about.">{{ (form.summary or '') if form else '' }}</textarea>
+    </label>
+
+    <label>
+        Acceptance criteria
+        <textarea name="acceptance_criteria"
+                  placeholder="- When I do X, Y happens&#10;- Error Z no longer appears">{{ (form.acceptance_criteria or '') if form else '' }}</textarea>
+        <div class="hint">One per line. Lines starting with <code>-</code> or bullets are fine.</div>
+    </label>
+
+    <label>
+        Suggested steps
+        <textarea name="suggested_steps"
+                  placeholder="- Review current implementation in ...&#10;- Add tests for ...">{{ (form.suggested_steps or '') if form else '' }}</textarea>
+        <div class="hint">One step per line. This is what Bob/Chad can follow later.</div>
+    </label>
+
+    <div class="actions">
+        <button type="submit">Create Ticket</button>
+    </div>
+</form>
+</body>
+</html>

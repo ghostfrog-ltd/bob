@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Bob Meta Tickets</title>
+    <style>
+        body { font-family: system-ui, sans-serif; margin: 2rem; background: #050810; color: #e5e7eb; }
+        a { color: #38bdf8; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        .ticket-list { display: flex; flex-direction: column; gap: 0.75rem; }
+        .ticket-card {
+          padding: 0.75rem 1rem;
+          background: #0b1120;
+          border-radius: 0.75rem;
+          border: 1px solid #1f2937;
+          display: flex;
+          justify-content: space-between;
+          align-items: baseline;
+          gap: 1rem;
+        }
+        .ticket-meta { font-size: 0.8rem; color: #9ca3af; }
+    </style>
+</head>
+<body>
+
+<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem;">
+    <h1 style="margin:0;">Meta Tickets</h1>
+
+    <a href="{{ url_for('meta.new_ticket') }}"
+       style="
+       background:#2563eb;
+       border:1px solid #1d4ed8;
+       color:#fff;
+       padding:0.45rem 0.9rem;
+       border-radius:0.5rem;
+       font-size:0.9rem;
+       text-decoration:none;
+     ">
+        + New Ticket
+    </a>
+</div>
+
+<p style="margin-bottom:1rem;">
+    Filter:
+    <a href="{{ url_for('meta.meta_index', status='open') }}"
+       style="{{ 'font-weight:bold;' if current_status == 'open' else '' }}">
+        Open
+    </a> ·
+    <a href="{{ url_for('meta.meta_index', status='done') }}"
+       style="{{ 'font-weight:bold;' if current_status == 'done' else '' }}">
+        Done
+    </a> ·
+    <a href="{{ url_for('meta.meta_index', status='all') }}"
+       style="{{ 'font-weight:bold;' if current_status == 'all' else '' }}">
+        All
+    </a>
+</p>
+
+{% if tickets %}
+<div class="ticket-list">
+    {% for t in tickets %}
+    <div class="ticket-card">
+        <div>
+            <a href="{{ url_for('meta.meta_detail', ticket_id=t.ticket_id) }}">
+                {{ t.ticket_id }} – {{ t.title }}
+            </a>
+            <div class="ticket-meta">
+                {{ t.component or t.area or 'unknown component' }} ·
+                priority: {{ t.priority or 'unknown' }} ·
+                {% if t.status == 'done' %}
+                <span class="badge" style="background:#14532d;border-color:#166534;">✔ Done</span>
+                {% else %}
+                <span class="badge" style="background:#451a03;border-color:#7c2d12;">Open</span>
+                {% endif %}
+                {% if t.last_result %}
+                · last run: {{ t.last_result }}
+                {% endif %}
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+{% else %}
+<p>No tickets found in <code>data/meta/tickets</code>.</p>
+{% endif %}
+</body>
+</html>

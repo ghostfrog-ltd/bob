@@ -31,6 +31,7 @@ from bob.planner import bob_build_plan, bob_refine_codemod_with_files
 from bob.chat import bob_simple_chat, bob_answer_with_context
 from chad.executor import chad_execute_plan as _chad_execute_plan
 from web.chat import create_chat_blueprint
+from meta.web import  meta_bp
 
 # ---------------------------------------------------------------------------
 # Env
@@ -161,6 +162,8 @@ chat_bp = create_chat_blueprint(
     auto_repair_fn=_auto_repair_then_retry_async,
 )
 app.register_blueprint(chat_bp)
+
+app.register_blueprint(meta_bp)
 
 # ---------------------------------------------------------------------------
 # Run tests before starting server
