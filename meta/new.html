@@ -121,6 +121,14 @@
         <div class="hint">One step per line. This is what Bob/Chad can follow later.</div>
     </label>
 
+    <label>
+        Safe Paths (one per line)
+        <textarea name="safe_paths" id="safe_paths" rows="5"
+                  placeholder="ui/chat_ui.html&#10;static/css/chat.css"
+                  class="form-control">{{ form.safe_paths if form.safe_paths else "" }}</textarea>
+        <div class="hint">One step per line. The paths that can be changed</div>
+    </label>
+
     <div class="actions">
         <button type="submit">Create Ticket</button>
     </div>

@@ -37,7 +37,7 @@ def chad_execute_plan(
     Chad executes Bob's plan.
 
     Rules:
-      - For task.type == 'tool'  → runs a local tool via chad.tools.
+      - For task.type == 'tool'     → runs a local tool via chad.tools.
       - For task.type == 'analysis' → reads a file snippet for Bob.
       - For task.type == 'codemod'  → applies edits INSIDE project_root.
       - Returns a dict exec_report; NEVER returns None.
@@ -202,27 +202,34 @@ def chad_execute_plan(
             )
             continue
 
-        if not target_path.exists():
-            edit_logs.append(
-                {
-                    "file": file_rel,
-                    "operation": op,
-                    "reason": "target file does not exist on disk",
-                }
-            )
-            continue
-
-        try:
-            original = target_path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            edit_logs.append(
-                {
-                    "file": file_rel,
-                    "operation": op,
-                    "reason": "could not read target file from disk",
-                }
-            )
-            continue
+        # Decide how to handle non-existent files based on the operation.
+        # Some ops (create_or_overwrite_file, replace, append_to_bottom) can
+        # legitimately create a new file; others (like prepend_comment) require it.
+        if target_path.exists():
+            try:
+                original = target_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                edit_logs.append(
+                    {
+                        "file": file_rel,
+                        "operation": op,
+                        "reason": "could not read target file from disk",
+                    }
+                )
+                continue
+        else:
+            if op in ("create_or_overwrite_file", "replace", "append_to_bottom"):
+                # Treat this as creating a new file; original content is empty.
+                original = ""
+            else:
+                edit_logs.append(
+                    {
+                        "file": file_rel,
+                        "operation": op,
+                        "reason": "target file does not exist on disk",
+                    }
+                )
+                continue
 
         if op == "create_or_overwrite_file":
             new_text = normalize_newlines(content)
@@ -260,6 +267,46 @@ def chad_execute_plan(
                     "file": file_rel,
                     "operation": op,
                     "reason": "file overwritten with new content",
+                }
+            )
+
+        elif op == "replace":
+            # Overwrite the entire file contents with `content`.
+            new_text = normalize_newlines(content)
+
+            if contains_suspicious_control_chars(new_text):
+                cleaned = strip_suspicious_control_chars(new_text)
+                edit_logs.append(
+                    {
+                        "file": file_rel,
+                        "operation": op,
+                        "reason": (
+                            "new content contained suspicious control characters "
+                            "which were stripped"
+                        ),
+                    }
+                )
+                new_text = cleaned
+
+            norm_old = normalize_newlines(original)
+            norm_new = new_text
+            if norm_old == norm_new:
+                edit_logs.append(
+                    {
+                        "file": file_rel,
+                        "operation": op,
+                        "reason": "replace produced no effective change",
+                    }
+                )
+                continue
+
+            safe_write_text(target_path, new_text)
+            touched.append(str(target_path.relative_to(project_root)))
+            edit_logs.append(
+                {
+                    "file": file_rel,
+                    "operation": op,
+                    "reason": "file replaced with new content",
                 }
             )
 

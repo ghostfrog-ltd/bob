@@ -143,6 +143,87 @@ def run_ticket(ticket_id: str):
 
     return redirect(url_for("meta.meta_detail", ticket_id=ticket_id))
 
+@meta_bp.route("/<ticket_id>/edit", methods=["GET", "POST"])
+def edit_ticket(ticket_id: str):
+    ticket = get_ticket_by_id(ticket_id)
+    if not ticket:
+        abort(404)
+
+    # Helper to keep behaviour consistent with new_ticket()
+    def _split_lines(block: str) -> list[str]:
+        return [
+            line.strip("-• ").strip()
+            for line in block.splitlines()
+            if line.strip()
+        ]
+
+    if request.method == "POST":
+        title = (request.form.get("title") or "").strip()
+        area = (request.form.get("component") or "").strip()
+        priority = (request.form.get("priority") or "medium").strip()
+        summary = (request.form.get("summary") or "").strip()
+
+        acceptance_raw = request.form.get("acceptance_criteria") or ""
+        steps_raw = request.form.get("suggested_steps") or ""
+        safe_paths_raw = request.form.get("safe_paths") or ""
+
+        if not title:
+            # Re-render form with error + posted data
+            form = dict(request.form)
+            form.setdefault("safe_paths", safe_paths_raw)
+            return render_template(
+                "meta_new.html",  # reuse same template
+                error="Title is required.",
+                form=form,
+                ticket=ticket,
+                edit_mode=True,
+            )
+
+        evidence = _split_lines(acceptance_raw)
+        suggested_steps = _split_lines(steps_raw)
+        safe_paths = [
+            line.strip().lstrip("-• ").strip()
+            for line in safe_paths_raw.splitlines()
+            if line.strip()
+        ]
+
+        # Update fields on the existing ticket dict
+        ticket["title"] = title
+        ticket["area"] = area or ticket.get("area", "general")
+        ticket["priority"] = priority
+        ticket["description"] = summary or title
+        ticket["summary"] = summary or title
+        ticket["evidence"] = evidence
+        ticket["acceptance_criteria"] = evidence
+        ticket["suggested_steps"] = suggested_steps
+        ticket["safe_paths"] = safe_paths
+
+        # Keep id/ticket_id/created_at/kind/status as-is
+        path = TICKETS_DIR / f"{ticket_id}.json"
+        TICKETS_DIR.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(ticket, f, indent=2)
+
+        return redirect(url_for("meta.meta_detail", ticket_id=ticket_id))
+
+    # GET: pre-populate form from existing ticket
+    form = {
+        "title": ticket.get("title", ""),
+        "component": ticket.get("area", ""),
+        "priority": ticket.get("priority", "medium"),
+        "summary": ticket.get("summary") or ticket.get("description", ""),
+        "acceptance_criteria": "\n".join(ticket.get("evidence") or []),
+        "suggested_steps": "\n".join(ticket.get("suggested_steps") or []),
+        "safe_paths": "\n".join(ticket.get("safe_paths") or []),
+    }
+
+    return render_template(
+        "new.html",  # reuse same template
+        error=None,
+        form=form,
+        ticket=ticket,
+        edit_mode=True,
+    )
 
 @meta_bp.route("/new", methods=["GET", "POST"])
 def new_ticket():
@@ -179,6 +260,13 @@ def new_ticket():
         raw_issue_key = f"manual:{id_str}"
         kind = (request.form.get("kind") or "self_improvement").strip()
 
+        safe_paths_raw = request.form.get("safe_paths") or ""
+        safe_paths = [
+            line.strip().lstrip("-• ").strip()
+            for line in safe_paths_raw.splitlines()
+            if line.strip()
+        ]
+
         ticket: Dict[str, Any] = {
             "id": id_str,
             "scope": "self",
@@ -188,15 +276,17 @@ def new_ticket():
             "evidence": evidence,
             "priority": priority,
             "created_at": created_at,
-            "safe_paths": [],
+            "safe_paths": safe_paths,
             "raw_issue_key": raw_issue_key,
             "ticket_id": ticket_id,
             "status": "open",
-            "kind": kind,  # 👈 important
-            # also add UI-friendly mirrors so templates stay happy:
+            "kind": kind,
             "summary": summary or title,
             "acceptance_criteria": evidence,
             "suggested_steps": _split_lines(steps_raw),
+            "last_run": None,
+            "last_bob_reply": None,
+            "last_chad_summary": None,
         }
 
         TICKETS_DIR.mkdir(parents=True, exist_ok=True)

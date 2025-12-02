@@ -10,16 +10,71 @@ from helpers.prompts import get_prompt
 from helpers.tools_prompt import describe_tools_for_prompt
 from .config import get_openai_client, get_model_name
 from .schema import BOB_PLAN_SCHEMA
+import re
+
+
+def _extract_first_json_object(text: str) -> str:
+    """
+    Try to grab the first top-level JSON object from a messy LLM response.
+
+    Handles cases like:
+        {"a": 1}{"b": 2}
+        ```json
+        {...}
+        ```
+    by returning only the first balanced {...}.
+    """
+    start = text.find("{")
+    if start == -1:
+        raise ValueError("No opening '{' found in text")
+
+    depth = 0
+    in_string = False
+    escape = False
+
+    for i in range(start, len(text)):
+        ch = text[i]
+
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+            continue
+
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                # end of the first top-level object
+                return text[start : i + 1]
+
+    raise ValueError("Could not find balanced JSON object in text")
+
+
+def parse_plan_json(raw: str) -> dict:
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        cleaned = _extract_first_json_object(raw)
+        return json.loads(cleaned)
 
 
 def bob_build_plan(
-    id_str: str,
-    date_str: str,
-    base: str,
-    user_text: str,
-    queue_dir: Optional[Path] = None,
-    *,
-    tools_enabled: bool = True,
+        id_str: str,
+        date_str: str,
+        base: str,
+        user_text: str,
+        queue_dir: Optional[Path] = None,
+        *,
+        tools_enabled: bool = True,
 ) -> Dict[str, Any]:
     """
     Build a structured plan for Chad to execute.
@@ -104,13 +159,7 @@ def bob_build_plan(
         )
 
         raw = (resp.output_text or "").strip()
-        # Try to recover a single JSON object if extra text sneaks in.
-        first = raw.find("{")
-        last = raw.rfind("}")
-        if first != -1 and last != -1:
-            raw = raw[first : last + 1]
-
-        body = json.loads(raw)
+        body = parse_plan_json(raw)
 
         task_type = body.get("task_type", "analysis")
         summary = (body.get("summary") or user_text).strip()
@@ -149,9 +198,9 @@ def bob_build_plan(
 
 
 def bob_refine_codemod_with_files(
-    user_text: str,
-    base_task: Dict[str, Any],
-    file_contexts: Dict[str, str],
+        user_text: str,
+        base_task: Dict[str, Any],
+        file_contexts: Dict[str, str],
 ) -> Dict[str, Any]:
     """
     Second-pass planner for codemods: refine an existing task given real file contents.
@@ -205,12 +254,7 @@ def bob_refine_codemod_with_files(
         )
 
         raw = (resp.output_text or "").strip()
-        first = raw.find("{")
-        last = raw.rfind("}")
-        if first != -1 and last != -1:
-            raw = raw[first : last + 1]
-
-        body = json.loads(raw)
+        body = parse_plan_json(raw)
 
         summary = (body.get("summary") or base_task.get("summary", "")).strip()
         edits = body.get("edits") or []

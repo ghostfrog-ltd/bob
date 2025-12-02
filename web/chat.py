@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Any, Dict, List
 
-from flask import Blueprint, jsonify, request, render_template_string
+from flask import Blueprint, jsonify, request, render_template_string, send_from_directory
 
 
 def create_chat_blueprint(
@@ -28,6 +28,16 @@ def create_chat_blueprint(
     Build the 'chat' blueprint, wiring in all non-HTTP dependencies via DI.
     """
     bp = Blueprint("chat", __name__)
+
+    @bp.route("/<path:filename>")
+    def serve_ui_files(filename: str):
+        """
+        Serve arbitrary files from the 'ui' directory.
+        Works for CSS, JS, images, etc.
+        No hard-coded filenames.
+        """
+        ui_dir = project_root / "ui"
+        return send_from_directory(str(ui_dir), filename)
 
     @bp.route("/chat", methods=["GET"])
     def chat_page():

@@ -24,8 +24,7 @@ from dataclasses import dataclass, asdict, fields as dataclass_fields
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Iterable, List, Dict, Any, Tuple, Optional
-
-# NOTE: meta_log intentionally stays inside bob/
+from bob.planner import bob_refine_codemod_with_files
 from .log import log_history_record
 
 logger = logging.getLogger("meta")
@@ -52,6 +51,40 @@ SAFE_SELF_PATHS: Tuple[str, ...] = (
 
 META_TARGET_SELF = "self"
 META_TARGET_GF = "ghostfrog"
+
+
+def _build_file_contexts_for_edits(edits: List[Dict[str, Any]]) -> Dict[str, str]:
+    """
+    Build a mapping of file path -> file contents for the files mentioned in edits.
+
+    We keep it simple: read files relative to ROOT_DIR, skip missing ones,
+    and optionally truncate very large files.
+    """
+    file_contexts: Dict[str, str] = {}
+    seen: set[str] = set()
+
+    for e in edits:
+        rel = e.get("file")
+        if not rel or rel in seen:
+            continue
+        seen.add(rel)
+
+        p = ROOT_DIR / rel
+        if not p.exists() or not p.is_file():
+            continue
+
+        try:
+            text = p.read_text(encoding="utf-8")
+        except Exception:
+            continue
+
+        # Optional: truncate to avoid gigantic prompts
+        if len(text) > 20000:
+            text = text[:20000] + "\n\n<!-- truncated by meta -->"
+
+        file_contexts[rel] = text
+
+    return file_contexts
 
 
 # ---------------------------------------------------------------------
@@ -235,6 +268,9 @@ def run_ticket_with_tests(ticket: Ticket, max_attempts: int = 2) -> Dict[str, An
         prompt = build_action_prompt(ticket)
         result = run_self_improvement_prompt(prompt, ticket)
 
+        exec_message = (result.get("exec_report") or {}).get("message")
+        bob_reply = result.get("bob_reply") or ""
+
         attempts = [
             {
                 "attempt": 1,
@@ -242,13 +278,16 @@ def run_ticket_with_tests(ticket: Ticket, max_attempts: int = 2) -> Dict[str, An
                 "error_summary": result.get("error_summary"),
                 "tests_ok": True,
                 "pytest_output": "",
-                "exec_message": (result.get("exec_report") or {}).get("message"),
+                "exec_message": exec_message,
+                "bob_reply": bob_reply,
             }
         ]
         return {
             "success": True,  # if Bob/Chad ran, we treat as success here
             "attempts": attempts,
             "last_error": None,
+            "bob_reply": bob_reply,
+            "last_exec_message": exec_message,
         }
 
     # -------- existing self_improvement logic below --------
@@ -264,6 +303,9 @@ def run_ticket_with_tests(ticket: Ticket, max_attempts: int = 2) -> Dict[str, An
 
         tests_ok, pytest_out = _run_pytest()
         tests_label = "pass" if tests_ok else "fail"
+
+        exec_message = (result.get("exec_report") or {}).get("message")
+        bob_reply = result.get("bob_reply") or ""
 
         # Log
         try:
@@ -289,7 +331,8 @@ def run_ticket_with_tests(ticket: Ticket, max_attempts: int = 2) -> Dict[str, An
                 "error_summary": result.get("error_summary"),
                 "tests_ok": tests_ok,
                 "pytest_output": pytest_out,
-                "exec_message": (result.get("exec_report") or {}).get("message"),
+                "exec_message": exec_message,
+                "bob_reply": bob_reply,
             }
         )
 
@@ -300,7 +343,14 @@ def run_ticket_with_tests(ticket: Ticket, max_attempts: int = 2) -> Dict[str, An
         last_error = pytest_out
         _restore_files(snap)
 
-    return {"success": success, "attempts": attempts, "last_error": last_error}
+    last_attempt = attempts[-1] if attempts else {}
+    return {
+        "success": success,
+        "attempts": attempts,
+        "last_error": last_error,
+        "bob_reply": last_attempt.get("bob_reply") or "",
+        "last_exec_message": last_attempt.get("exec_message"),
+    }
 
 
 # ---------------------------------------------------------------------
@@ -500,6 +550,7 @@ def build_action_prompt(ticket: Ticket) -> str:
         """
     ).strip()
 
+
 def build_self_improvement_prompt(ticket: Ticket) -> str:
     return textwrap.dedent(
         f"""
@@ -520,7 +571,9 @@ def build_self_improvement_prompt(ticket: Ticket) -> str:
           All pytest tests must pass.
 
         Constraints:
-        - No new modules or files.
+        - Do NOT create new modules or files,
+          unless the ticket description explicitly requests creating a specific file
+          AND that file is within the allowed safe_paths.
         - Keep diffs small.
         - Do not weaken jail or safety.
         - Prefer prompt changes, small heuristics, or shallow adjustments.
@@ -532,6 +585,50 @@ def build_self_improvement_prompt(ticket: Ticket) -> str:
 # Core executor: Bob + Chad runner
 # ---------------------------------------------------------------------
 
+import fnmatch
+
+
+def is_allowed(rel: str, allowed: list[str]) -> bool:
+    for pattern in allowed:
+        pattern = pattern.strip()
+
+        # 1. Exact match (old behaviour)
+        if rel == pattern:
+            return True
+
+        # 2. Wildcards like ui/* or ui/*.css
+        if fnmatch.fnmatch(rel, pattern):
+            return True
+
+        # 3. Prefix match: "ui/" means all files under ui/
+        if pattern.endswith("/") and rel.startswith(pattern):
+            return True
+
+    return False
+
+def _block_dangerous_overwrites(plan: dict) -> dict:
+    task = plan.get("task") or {}
+    edits = task.get("edits") or []
+    if not edits:
+        return plan
+
+    safe_edits = []
+    blocked = []
+    for e in edits:
+        rel = (e.get("file") or "").strip()
+        op = (e.get("operation") or "").strip()
+        # If the file already exists and the op is create_or_overwrite_file, drop it
+        if op == "create_or_overwrite_file" and (ROOT_DIR / rel).exists():
+            blocked.append(rel)
+            continue
+        safe_edits.append(e)
+
+    if blocked:
+        print(f"[meta] Blocked create_or_overwrite_file on existing files: {blocked}")
+    task["edits"] = safe_edits
+    plan["task"] = task
+    return plan
+
 def run_self_improvement_prompt(prompt: str, ticket: Ticket) -> Dict[str, Any]:
     from app import bob_build_plan, chad_execute_plan, next_message_id
 
@@ -539,6 +636,9 @@ def run_self_improvement_prompt(prompt: str, ticket: Ticket) -> Dict[str, Any]:
     QUEUE_DIR.mkdir(parents=True, exist_ok=True)
     (QUEUE_DIR / f"{base}.user.txt").write_text(prompt, encoding="utf-8")
 
+    # --------------------
+    # 1) First-pass plan
+    # --------------------
     plan = bob_build_plan(
         id_str=id_str,
         date_str=date_str,
@@ -547,9 +647,13 @@ def run_self_improvement_prompt(prompt: str, ticket: Ticket) -> Dict[str, Any]:
         tools_enabled=True,
     )
 
-    # enforce safe_paths
     task = plan.get("task") or {}
+    task_type = task.get("type") or "analysis"
     edits = task.get("edits") or []
+
+    # --------------------
+    # 2) Enforce safe_paths on first pass
+    # --------------------
     if edits:
         allowed = set(ticket.safe_paths)
         filtered = []
@@ -561,9 +665,63 @@ def run_self_improvement_prompt(prompt: str, ticket: Ticket) -> Dict[str, Any]:
             else:
                 dropped.append(rel or "(none)")
         if dropped:
-            print("[meta] Dropped edits:", dropped)
+            print("[meta] Dropped edits on first pass:", dropped)
         task["edits"] = filtered
         plan["task"] = task
+        edits = filtered
+
+    # --------------------
+    # 3) Optional second-pass refinement for codemods
+    # --------------------
+    # If Bob chose a codemod and we still have edits, load file contexts and refine.
+    if task_type == "codemod" and edits and ticket.safe_paths:
+        try:
+            file_contexts = _build_file_contexts_for_edits(edits)
+            if file_contexts:
+                refined_task = bob_refine_codemod_with_files(
+                    user_text=prompt,
+                    base_task=task,
+                    file_contexts=file_contexts,
+                )
+
+                # Re-apply safe_paths after refinement
+                refined_edits = refined_task.get("edits") or []
+                if refined_edits:
+                    allowed = set(ticket.safe_paths)
+                    filtered = []
+                    dropped = []
+                    for e in refined_edits:
+                        rel = e.get("file")
+                        if rel in allowed:
+                            filtered.append(e)
+                        else:
+                            dropped.append(rel or "(none)")
+                    if dropped:
+                        print("[meta] Dropped edits on refine pass:", dropped)
+                    refined_task["edits"] = filtered
+
+                # Replace task in plan with refined version
+                plan["task"] = refined_task
+                task = refined_task
+                edits = refined_task.get("edits") or []
+        except Exception as refine_err:
+            # If refinement fails, just log and continue with the original task
+            print(f"[meta] Refine codemod failed: {refine_err!r}")
+
+    # --------------------
+    # 4) Build bob_reply string for the ticket UI
+    # --------------------
+    try:
+        # Store the full plan JSON so you can see exactly what Bob decided
+        bob_reply = json.dumps(plan, indent=2, ensure_ascii=False)
+    except Exception:
+        bob_reply = str(plan)
+
+    # --------------------
+    # 5) Execute with Chad
+    # --------------------
+
+    plan = _block_dangerous_overwrites(plan)
 
     exec_report = chad_execute_plan(
         id_str=id_str, date_str=date_str, base=base, plan=plan
@@ -597,6 +755,7 @@ def run_self_improvement_prompt(prompt: str, ticket: Ticket) -> Dict[str, Any]:
         "exec_report": exec_report,
         "result_label": result_label,
         "error_summary": err,
+        "bob_reply": bob_reply
     }
 
 
@@ -630,6 +789,8 @@ def _update_ticket_file_status(
         last_result: Optional[str] = None,
         last_error: Optional[str] = None,
         last_exec_message: Optional[str] = None,
+        last_bob_reply: Optional[str] = None,
+        last_chad_summary: Optional[str] = None,
 ) -> None:
     """
     Update the JSON ticket file with status / last_run info so the web UI
@@ -645,6 +806,13 @@ def _update_ticket_file_status(
     for path in TICKETS_DIR.glob("*.json"):
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
+
+            if last_bob_reply is not None:
+                # store a reasonably-sized slice so JSON doesn’t explode
+                raw["last_bob_reply"] = last_bob_reply[:4000]
+
+            if last_chad_summary is not None:
+                raw["last_chad_summary"] = last_chad_summary[:1000]
         except Exception:
             continue
 
@@ -756,6 +924,8 @@ def cmd_run_ticket(args: argparse.Namespace) -> None:
     last_attempt = (summary.get("attempts") or [])[-1] if summary.get("attempts") else {}
     exec_msg = last_attempt.get("exec_message")
 
+    bob_reply = summary.get("bob_reply") or last_attempt.get("bob_reply")
+
     if summary["success"]:
         mark_ticket_completed(ticket)
         _update_ticket_file_status(
@@ -763,6 +933,8 @@ def cmd_run_ticket(args: argparse.Namespace) -> None:
             status="done",
             last_result="OK",
             last_exec_message=exec_msg,
+            last_bob_reply=bob_reply,
+            last_chad_summary=exec_msg,
         )
     else:
         err = summary.get("last_error") or "pytest failed"
@@ -773,6 +945,8 @@ def cmd_run_ticket(args: argparse.Namespace) -> None:
             last_result="FAILED",
             last_error=err,
             last_exec_message=exec_msg,
+            last_bob_reply=bob_reply,
+            last_chad_summary=exec_msg,
         )
 
 

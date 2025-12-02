@@ -18,6 +18,7 @@
 <p><a href="{{ url_for('meta.meta_index') }}">← Back to tickets</a></p>
 
 <h1>{{ ticket.title }}</h1>
+
 <div>
     <span class="badge">ID: {{ ticket.ticket_id }}</span>
     {% if ticket.priority %}<span class="badge">priority: {{ ticket.priority }}</span>{% endif %}
@@ -86,6 +87,22 @@
 </div>
 {% endif %}
 
+<div style="margin-top:1rem; display:flex; gap:0.5rem; align-items:center;">
+
+
+<form method="get" action="{{ url_for('meta.edit_ticket', ticket_id=ticket.ticket_id) }}">
+    <button type="submit" style="
+        background: #14532d;
+        color: #fff;
+        padding: 0.4rem 0.8rem;
+        border-radius: 0.4rem;
+        border: 1px solid #166534;
+        cursor: pointer;
+    ">Edit ticket</button>
+</form>
+
+</div>
+
 
 {% if ticket.summary %}
 <h2>Summary</h2>
@@ -110,9 +127,37 @@
 </ol>
 {% endif %}
 
+{% if ticket.safe_paths %}
+<h2>Safe Paths</h2>
+<ol>
+    {% for path in ticket.safe_paths %}
+    <li>{{ path }}</li>
+    {% endfor %}
+</ol>
+{% endif %}
+
+
 {% if ticket.raw %}
 <h2>Raw</h2>
 <pre>{{ ticket | tojson(indent=2) }}</pre>
 {% endif %}
+
+{% if ticket.last_bob_reply %}
+  <hr>
+  <h2>Last Bob reply</h2>
+  <pre style="white-space: pre-wrap; font-family: monospace;">
+{{ ticket.last_bob_reply }}
+  </pre>
+{% endif %}
+
+{% if ticket.last_chad_summary %}
+  <hr>
+  <h2>Last Chad summary</h2>
+  <pre style="white-space: pre-wrap; font-family: monospace;">
+{{ ticket.last_chad_summary }}
+  </pre>
+{% endif %}
+
+
 </body>
 </html>
